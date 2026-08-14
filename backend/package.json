@@ -8,7 +8,8 @@
     "dev": "nodemon src/server.js",
     "migrate": "node src/migrations/run.js",
     "seed": "node src/migrations/seed.js",
-    "seed:verifier": "node src/migrations/seed-verifier.js"
+    "seed:verifier": "node src/migrations/seed-verifier.js",
+    "test:orders": "node test/shopify-orders.test.js"
   },
   "dependencies": {
     "axios": "^1.6.0",

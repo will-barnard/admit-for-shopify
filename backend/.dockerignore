@@ -11,3 +11,4 @@ Dockerfile*
 .dockerignore
 uploads/
 debug-webhook.js
+test/

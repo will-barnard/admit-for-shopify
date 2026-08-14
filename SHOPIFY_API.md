@@ -1,102 +1,99 @@
 # Shopify Integration API
 
-This endpoint allows Shopify to automatically create attendee tickets when purchases are made.
+Endpoints Shopify calls to keep tickets in sync with orders. Currently driven by
+Shopify Flow "Send HTTP request" actions.
 
-## Endpoint
+> **Auth:** every endpoint except `/health` requires an `x-api-key` header whose
+> value matches the `SHOPIFY_API_KEY` environment variable. The key is a shared
+> secret — it lives in `.env` and the Beachhead dashboard, and must never be
+> committed to this repo or pasted into documentation.
 
-```
-POST /api/shopify/create-ticket
-```
+> **Planned change:** this static-key scheme is a stopgap. A real Shopify app
+> verifies the `X-Shopify-Hmac-Sha256` signature over the raw request body
+> instead, which removes the shared secret entirely. See `SHOPIFY_APP_SCOPE.md`.
 
-## Authentication
+## `POST /api/shopify/create-ticket`
 
-Include the API key in the request headers:
-
-```
-x-api-key: REDACTED-ROTATED-KEY
-```
-
-## Request Body
-
-```json
-{
-  "name": "John Doe",
-  "email": "john@example.com",
-  "ticket_subtype": "adult_2day",
-  "quantity": 1
-}
-```
-
-### Fields
-
-- **name** (required): Full name of the ticket holder
-- **email** (required): Email address for ticket delivery
-- **ticket_subtype** (required): Type of attendee ticket. Valid values:
-  - `vip` - VIP Pass (Friday, Saturday, Sunday)
-  - `adult_2day` - Adult 2-Day Pass (Saturday, Sunday)
-  - `adult_saturday` - Adult 1-Day Pass (Saturday)
-  - `adult_sunday` - Adult 1-Day Pass (Sunday)
-  - `child_2day` - Child 2-Day Pass (Saturday, Sunday)
-  - `child_saturday` - Child 1-Day Pass (Saturday)
-  - `child_sunday` - Child 1-Day Pass (Sunday)
-- **quantity** (optional): Number of tickets to create (default: 1, max: 10)
-
-## Response
-
-### Success (201 Created)
+Creates one ticket per unit of every line item whose SKU matches an event.
+Events are matched on `events.sku` (case-insensitive) and must be `active` and
+not `archived`. Line items with unknown SKUs are ignored.
 
 ```json
 {
-  "success": true,
-  "message": "Successfully created 2 ticket(s)",
-  "tickets": [
-    {
-      "id": 123,
-      "uuid": "550e8400-e29b-41d4-a716-446655440000",
-      "email_sent": true
-    },
-    {
-      "id": 124,
-      "uuid": "650e8400-e29b-41d4-a716-446655440001",
-      "email_sent": true
-    }
+  "id": 5123456789012,
+  "customer": {
+    "first_name": "John",
+    "last_name": "Doe",
+    "email": "john@example.com"
+  },
+  "line_items": [
+    { "id": 14567890123456, "sku": "CDS-2DAY", "quantity": 2, "name": "2-Day Pass" },
+    { "id": 14567890123457, "sku": "CDS-SAT",  "quantity": 1, "name": "Saturday Pass" }
   ]
 }
 ```
 
-### Error (400 Bad Request)
+| Field | Required | Notes |
+|---|---|---|
+| `id` | recommended | Shopify order id. Used for duplicate detection and for refund/cancel matching. Without it, retries will create duplicate tickets. |
+| `customer.first_name` | **yes** | Request is rejected without it. |
+| `customer.last_name` | no | |
+| `customer.email` | no | Tickets can exist without an email; they just aren't sent. |
+| `line_items[].id` | recommended | Shopify line item id. Required for partial refunds to void only the refunded tickets. |
+| `line_items[].sku` | **yes** | Matched against `events.sku`. |
+| `line_items[].quantity` | no | Defaults to 1. One ticket is created per unit. |
+
+**Responses**
+
+- `201` — tickets created. Body includes `tickets[]` and `email_sent`.
+- `200` `{ "duplicate": true }` — an order with this id already has tickets. Safe to retry.
+- `200` `{ "tickets": [] }` — no line item matched a sellable event.
+- `400` — missing `line_items` array or `customer.first_name`.
+- `401` — bad or missing `x-api-key`.
+- `423` — lockdown mode is on.
+
+Emails are sent as one consolidated message per order when `auto_send_emails` is
+enabled, subject to a 100-message daily cap.
+
+## `POST /api/shopify/refund`
 
 ```json
 {
-  "error": "Missing required fields: name, email, and ticket_subtype are required"
+  "order_id": 5123456789012,
+  "refund_line_items": [
+    { "line_item_id": 14567890123456, "quantity": 1 }
+  ],
+  "transactions": []
 }
 ```
 
-### Error (401 Unauthorized)
+Marks tickets `refunded`. **Partial refunds are respected**: only `quantity`
+tickets are voided per refunded line item, preferring tickets that have not been
+scanned. Tickets created before `shopify_line_item_id` was recorded cannot be
+matched — for those orders the whole order is voided and the admin notification
+says so.
+
+## `POST /api/shopify/cancel`
+
+Same payload shape; marks tickets `cancelled`. No line item scoping — an order
+cancellation voids every ticket on the order.
+
+## `POST /api/shopify/chargeback`
 
 ```json
-{
-  "error": "Unauthorized: Invalid API key"
-}
+{ "id": "dispute-id", "order_id": 5123456789012 }
 ```
 
-## Example cURL Request
+Marks tickets `chargeback` and sends an admin alert.
 
-```bash
-curl -X POST http://your-nas-ip:49191/api/shopify/create-ticket \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: REDACTED-ROTATED-KEY" \
-  -d '{
-    "name": "John Doe",
-    "email": "john@example.com",
-    "ticket_subtype": "adult_2day",
-    "quantity": 2
-  }'
-```
+## `GET /api/shopify/health`
+
+No auth. Returns `{ "status": "ok", "service": "shopify-integration" }`.
 
 ## Notes
 
-- Tickets are automatically emailed if `auto_send_emails` is enabled in settings
-- Each ticket gets a unique UUID for QR code verification
-- The endpoint supports creating multiple tickets in a single request (up to 10)
-- Only attendee tickets can be created via this API (student and exhibitor tickets must be created manually)
+- Refund, cancel and chargeback deliberately **ignore lockdown mode**. Voiding a
+  refunded ticket is a safety operation; blocking it during an event would leave
+  a refunded ticket scannable at the door.
+- Every request is recorded in `webhook_logs` and can be replayed from the
+  Webhooks page in the admin, which runs the same code path as the live endpoint.

@@ -131,6 +131,21 @@ async function runMigrations() {
     `);
     console.log('✓ Email column made nullable');
 
+    // Track which Shopify line item a ticket came from, so partial refunds can
+    // void only the refunded tickets instead of the whole order.
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'shopify_line_item_id'
+        ) THEN
+          ALTER TABLE tickets ADD COLUMN shopify_line_item_id VARCHAR(255);
+        END IF;
+      END $$;
+    `);
+    console.log('\u2713 shopify_line_item_id column ensured');
+
     // Create ticket scans table
     await db.query(`
       CREATE TABLE IF NOT EXISTS ticket_scans (
@@ -149,6 +164,7 @@ async function runMigrations() {
     await db.query(`CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status)`);
     await db.query(`CREATE INDEX IF NOT EXISTS idx_tickets_shopify_order_id ON tickets(shopify_order_id)`);
     await db.query(`CREATE INDEX IF NOT EXISTS idx_tickets_event_id ON tickets(event_id)`);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_tickets_shopify_line_item_id ON tickets(shopify_line_item_id)`);
     await db.query(`CREATE INDEX IF NOT EXISTS idx_ticket_scans_ticket_date ON ticket_scans(ticket_id, scan_date)`);
     await db.query(`CREATE INDEX IF NOT EXISTS idx_ticket_scans_user ON ticket_scans(scanned_by_user_id)`);
     console.log('✓ Indexes created');
