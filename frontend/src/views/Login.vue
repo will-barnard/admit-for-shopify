@@ -6,7 +6,7 @@
       </div>
       <h1>{{ conventionName }}</h1>
       <p class="subtitle">Event Ticket Manager</p>
-      <h2>{{ isRegisterMode ? 'Register' : 'Login' }}</h2>
+      <h2>Login</h2>
       
       <form @submit.prevent="handleSubmit">
         <div class="form-group">
@@ -36,16 +36,10 @@
         </div>
 
         <button type="submit" class="btn-primary">
-          {{ isRegisterMode ? 'Register' : 'Login' }}
+          Login
         </button>
       </form>
 
-      <p class="toggle-mode">
-        {{ isRegisterMode ? 'Already have an account?' : "Don't have an account?" }}
-        <a href="#" @click.prevent="toggleMode">
-          {{ isRegisterMode ? 'Login' : 'Register' }}
-        </a>
-      </p>
     </div>
   </div>
 </template>
@@ -65,7 +59,6 @@ export default {
     const username = ref('');
     const password = ref('');
     const error = ref('');
-    const isRegisterMode = ref(false);
     const logoUrl = ref(null);
     const conventionName = ref('Event Ticket Manager');
 
@@ -87,20 +80,11 @@ export default {
       error.value = '';
       
       try {
-        if (isRegisterMode.value) {
-          await authStore.register(username.value, password.value);
-        } else {
-          await authStore.login(username.value, password.value);
-        }
+        await authStore.login(username.value, password.value);
         router.push('/');
       } catch (err) {
         error.value = err.response?.data?.error || 'An error occurred';
       }
-    };
-
-    const toggleMode = () => {
-      isRegisterMode.value = !isRegisterMode.value;
-      error.value = '';
     };
 
     onMounted(() => {
@@ -111,11 +95,9 @@ export default {
       username,
       password,
       error,
-      isRegisterMode,
       logoUrl,
       conventionName,
       handleSubmit,
-      toggleMode,
     };
   },
 };
@@ -193,22 +175,6 @@ input:focus {
   margin-bottom: 20px;
 }
 
-.toggle-mode {
-  text-align: center;
-  margin-top: 20px;
-  color: #666;
-}
-
-.toggle-mode a {
-  color: #667eea;
-  text-decoration: none;
-  font-weight: 500;
-}
-
-.toggle-mode a:hover {
-  text-decoration: underline;
-}
-
 .logo-container {
   text-align: center;
   margin-bottom: 20px;
@@ -261,10 +227,6 @@ input:focus {
   .btn-login {
     padding: 12px;
     font-size: 15px;
-  }
-
-  .toggle-mode {
-    font-size: 13px;
   }
 }
 

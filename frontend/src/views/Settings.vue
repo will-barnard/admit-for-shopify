@@ -377,7 +377,7 @@ export default {
 
     const fetchSettings = async () => {
       try {
-        const response = await axios.get('/api/settings');
+        const response = await axios.get('/api/settings/admin');
         const data = response.data;
         
         settings.value = data;

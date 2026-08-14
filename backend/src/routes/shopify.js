@@ -5,6 +5,7 @@ const { sendTicketEmail, sendAdminNotification } = require('../services/email');
 const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
 const checkLockdown = require('../middleware/lockdown');
+const authMiddleware = require('../middleware/auth');
 
 // Middleware to validate Shopify Flow API key
 const validateApiKey = (req, res, next) => {
@@ -636,8 +637,10 @@ router.post('/cancel', validateApiKey, async (req, res) => {
   }
 });
 
-// Debug endpoint to see recent webhook activity
-router.get('/debug/webhooks', async (req, res) => {
+// Debug endpoint to see recent webhook activity (authenticated).
+// Was previously unauthenticated and exposed order IDs + ticket status counts publicly.
+// Largely duplicates GET /api/webhooks - consider removing.
+router.get('/debug/webhooks', authMiddleware, async (req, res) => {
   try {
     const recentWebhooks = await db.query(`
       SELECT 

@@ -1,2 +1,25 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Project notes (kept local)
 CLAUDE.md
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

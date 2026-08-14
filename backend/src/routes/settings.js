@@ -38,22 +38,49 @@ const upload = multer({
   }
 });
 
-// Get settings (public - no auth required for logo on login pages)
+// Get public settings (no auth - used for logo/org name on the login pages).
+// IMPORTANT: this endpoint is unauthenticated. Only ever return the columns
+// whitelisted below. It previously returned SELECT *, which leaked
+// receive_mode_secret and made /api/migration/receive world-writable.
+const PUBLIC_SETTINGS_COLUMNS = ['org_name', 'logo_url'];
+
 router.get('/', async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT ${PUBLIC_SETTINGS_COLUMNS.join(', ')} FROM settings LIMIT 1`
+    );
+    if (result.rows.length === 0) {
+      return res.json({ org_name: 'My Organization', logo_url: null });
+    }
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error fetching public settings:', error);
+    res.status(500).json({ error: 'Failed to fetch settings' });
+  }
+});
+
+// Get full settings (authenticated). Used by the admin Settings page.
+// receive_mode_secret is only returned to superadmins.
+router.get('/admin', auth, async (req, res) => {
   try {
     const result = await db.query('SELECT * FROM settings LIMIT 1');
     if (result.rows.length === 0) {
-      // Return default settings if none exist
       return res.json({
         id: 1,
         org_name: 'My Organization',
         logo_url: null,
         auto_send_emails: true,
         lockdown_mode: false,
+        receive_mode_enabled: false,
         timezone: 'America/Chicago'
       });
     }
-    res.json(result.rows[0]);
+
+    const settings = { ...result.rows[0] };
+    if (req.user.role !== 'superadmin') {
+      delete settings.receive_mode_secret;
+    }
+    res.json(settings);
   } catch (error) {
     console.error('Error fetching settings:', error);
     res.status(500).json({ error: 'Failed to fetch settings' });

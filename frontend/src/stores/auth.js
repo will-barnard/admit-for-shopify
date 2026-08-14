@@ -35,28 +35,6 @@ export const useAuthStore = defineStore('auth', {
       }
     },
 
-    async register(username, password) {
-      try {
-        const response = await axios.post('/api/auth/register', {
-          username,
-          password,
-        });
-
-        this.token = response.data.token;
-        this.user = response.data.user;
-
-        localStorage.setItem('token', response.data.token);
-        localStorage.setItem('user', JSON.stringify(response.data.user));
-
-        axios.defaults.headers.common['Authorization'] = `Bearer ${response.data.token}`;
-
-        return true;
-      } catch (error) {
-        console.error('Registration error:', error);
-        throw error;
-      }
-    },
-
     logout() {
       this.token = null;
       this.user = null;
