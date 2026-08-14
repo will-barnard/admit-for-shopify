@@ -1,0 +1,75 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: convention_tickets
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - internal
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      PORT: 3000
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@db:5432/convention_tickets
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: 2y
+      RESEND_API_KEY: ${RESEND_API_KEY}
+      EMAIL_FROM: ${EMAIL_FROM}
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      SHOPIFY_API_KEY: ${SHOPIFY_API_KEY}
+      FRONTEND_URL: ${FRONTEND_URL}
+    expose:
+      - "3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - backend_uploads:/app/uploads
+    command: sh -c "npm run migrate && npm run seed && node src/migrations/seed-superadmin.js && node src/migrations/seed-verifier.js && npm start"
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    expose:
+      - "80"
+    depends_on:
+      - backend
+    networks:
+      - internal
+
+  verifier:
+    build:
+      context: ./verifier
+      dockerfile: Dockerfile
+    expose:
+      - "80"
+    depends_on:
+      - backend
+    networks:
+      - internal
+
+volumes:
+  postgres_data:
+    name: event-ticket-manager-postgres
+  backend_uploads:
+    name: event-ticket-manager-uploads
+
+networks:
+  internal:
