@@ -17,8 +17,8 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
               e.archived as event_archived
        FROM tickets t
        LEFT JOIN events e ON t.event_id = e.id
-       WHERE t.uuid = $1`,
-      [uuid]
+       WHERE t.uuid = $1 AND t.shop_id = $2`,
+      [uuid, req.shopId]
     );
 
     if (ticketResult.rows.length === 0) {
@@ -52,8 +52,8 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
 
     // Check if already scanned
     const scanCheckResult = await db.query(
-      'SELECT scan_date FROM ticket_scans WHERE ticket_id = $1 LIMIT 1',
-      [ticket.id]
+      'SELECT scan_date FROM ticket_scans WHERE ticket_id = $1 AND shop_id = $2 LIMIT 1',
+      [ticket.id, req.shopId]
     );
 
     if (scanCheckResult.rows.length > 0) {
@@ -69,8 +69,8 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
 
     // Record the scan
     await db.query(
-      'INSERT INTO ticket_scans (ticket_id, scan_date, scanned_by_user_id) VALUES ($1, NOW(), $2)',
-      [ticket.id, req.user.id]
+      'INSERT INTO ticket_scans (shop_id, ticket_id, scan_date, scanned_by_user_id) VALUES ($1, $2, NOW(), $3)',
+      [req.shopId, ticket.id, req.user.id]
     );
 
     return res.json({

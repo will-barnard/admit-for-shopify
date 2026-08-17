@@ -18,8 +18,10 @@ router.get('/', authMiddleware, async (req, res) => {
               e.name as event_name,
               e.archived as event_archived
        FROM tickets t
-       LEFT JOIN events e ON t.event_id = e.id
-       ORDER BY t.created_at DESC`
+       LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+       WHERE t.shop_id = $1
+       ORDER BY t.created_at DESC`,
+      [req.shopId]
     );
     
     // Get all scans with scanner user info
@@ -27,7 +29,9 @@ router.get('/', authMiddleware, async (req, res) => {
       `SELECT ts.ticket_id, ts.scan_date, ts.scanned_by_user_id,
               u.username as scanned_by_username
        FROM ticket_scans ts
-       LEFT JOIN users u ON ts.scanned_by_user_id = u.id`
+       LEFT JOIN users u ON ts.scanned_by_user_id = u.id
+       WHERE ts.shop_id = $1`,
+      [req.shopId]
     );
     
     const tickets = ticketsResult.rows.map(ticket => {
@@ -70,20 +74,23 @@ router.post('/',
       const { eventId, name, email } = req.body;
 
       // Verify event exists
-      const eventResult = await db.query('SELECT id, name FROM events WHERE id = $1', [eventId]);
+      const eventResult = await db.query(
+        'SELECT id, name FROM events WHERE id = $1 AND shop_id = $2',
+        [eventId, req.shopId]
+      );
       if (eventResult.rows.length === 0) {
         return res.status(400).json({ error: 'Event not found' });
       }
 
-      const settingsResult = await db.query('SELECT auto_send_emails FROM settings LIMIT 1');
+      const settingsResult = await db.query('SELECT auto_send_emails FROM settings WHERE shop_id = $1', [req.shopId]);
       const autoSendEmails = settingsResult.rows.length > 0 ? settingsResult.rows[0].auto_send_emails : true;
 
       const ticketUuid = uuidv4();
       const verifyUrl = `${process.env.FRONTEND_URL}/verify/${ticketUuid}`;
 
       const result = await db.query(
-        'INSERT INTO tickets (event_id, name, email, uuid) VALUES ($1, $2, $3, $4) RETURNING *',
-        [eventId, name, email, ticketUuid]
+        'INSERT INTO tickets (shop_id, event_id, name, email, uuid) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+        [req.shopId, eventId, name, email, ticketUuid]
       );
 
       const ticket = result.rows[0];
@@ -97,10 +104,11 @@ router.post('/',
           await emailService.sendTicketEmail({
             to: email,
             name: name,
-            tickets: [{ ...ticket, qrCodeDataUrl, verifyUrl, event_name: eventResult.rows[0].name }]
+            tickets: [{ ...ticket, qrCodeDataUrl, verifyUrl, event_name: eventResult.rows[0].name }],
+            shopId: req.shopId
           });
           emailSent = true;
-          await db.query('UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = $1', [ticket.id]);
+          await db.query('UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = $1 AND shop_id = $2', [ticket.id, req.shopId]);
         } catch (emailErr) {
           console.error('Error sending email:', emailErr);
           emailError = 'Email could not be sent';
@@ -142,7 +150,10 @@ router.post('/create-order',
 
       // Validate all events exist
       for (const ticketItem of ticketItems) {
-        const eventResult = await db.query('SELECT id, name FROM events WHERE id = $1', [ticketItem.eventId]);
+        const eventResult = await db.query(
+          'SELECT id, name FROM events WHERE id = $1 AND shop_id = $2',
+          [ticketItem.eventId, req.shopId]
+        );
         if (eventResult.rows.length === 0) {
           return res.status(400).json({ error: 'Event not found: ' + ticketItem.eventId });
         }
@@ -150,7 +161,7 @@ router.post('/create-order',
 
       const manualOrderId = `manual-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-      const settingsResult = await db.query('SELECT auto_send_emails FROM settings LIMIT 1');
+      const settingsResult = await db.query('SELECT auto_send_emails FROM settings WHERE shop_id = $1', [req.shopId]);
       const autoSendEmails = settingsResult.rows.length > 0 ? settingsResult.rows[0].auto_send_emails : true;
 
       const createdTickets = [];
@@ -158,7 +169,10 @@ router.post('/create-order',
 
       // Preload event names
       const eventIds = [...new Set(ticketItems.map(t => t.eventId))];
-      const eventsResult = await db.query('SELECT id, name FROM events WHERE id = ANY($1)', [eventIds]);
+      const eventsResult = await db.query(
+        'SELECT id, name FROM events WHERE id = ANY($1) AND shop_id = $2',
+        [eventIds, req.shopId]
+      );
       const eventMap = {};
       eventsResult.rows.forEach(e => { eventMap[e.id] = e.name; });
 
@@ -171,8 +185,8 @@ router.post('/create-order',
           const verifyUrl = `${process.env.FRONTEND_URL}/verify/${ticketUuid}`;
 
           const result = await db.query(
-            'INSERT INTO tickets (event_id, name, email, uuid, shopify_order_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-            [eventId, name, customerEmail, ticketUuid, manualOrderId]
+            'INSERT INTO tickets (shop_id, event_id, name, email, uuid, shopify_order_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            [req.shopId, eventId, name, customerEmail, ticketUuid, manualOrderId]
           );
           const ticket = result.rows[0];
           const qrCodeDataUrl = await QRCode.toDataURL(verifyUrl);
@@ -194,8 +208,8 @@ router.post('/create-order',
           todayStart.setHours(0, 0, 0, 0);
           
           const quotaResult = await db.query(
-            'SELECT COUNT(*) as sent_today FROM email_send_log WHERE sent_at >= $1 AND success = true',
-            [todayStart]
+            'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
+            [req.shopId, todayStart]
           );
           
           const sentToday = parseInt(quotaResult.rows[0].sent_today);
@@ -206,23 +220,24 @@ router.post('/create-order',
             await emailService.sendTicketEmail({
               to: customerEmail,
               name: customerName,
-              tickets: createdTickets
+              tickets: createdTickets,
+              shopId: req.shopId
             });
-            
+
             emailSent = true;
-            
+
             const ticketIds = createdTickets.map(t => t.id);
             await db.query(
-              'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1)',
-              [ticketIds]
+              'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1) AND shop_id = $2',
+              [ticketIds, req.shopId]
             );
-            
-            for (const ticket of createdTickets) {
-              await db.query(
-                'INSERT INTO email_send_log (recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4)',
-                [customerEmail, ticket.id, 'manual_order', true]
-              );
-            }
+
+            // One row per message sent, not per ticket - the daily quota counts
+            // Resend messages. See services/shopify-orders.js.
+            await db.query(
+              'INSERT INTO email_send_log (shop_id, recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4, $5)',
+              [req.shopId, customerEmail, createdTickets[0].id, 'manual_order', true]
+            );
           } else {
             emailError = `Daily email limit of ${dailyLimit} reached. Tickets created but email not sent.`;
           }
@@ -277,13 +292,10 @@ router.delete('/reset-database', superAdminMiddleware, async (req, res) => {
   try {
     console.log('SuperAdmin initiated database reset - deleting all tickets');
     
-    await db.query('DELETE FROM ticket_scans');
-    console.log('Deleted all ticket scans');
-    
-    // Delete ticket_supplies if table exists
-    try { await db.query('DELETE FROM ticket_supplies'); } catch (e) { /* table may not exist */ }
-    
-    const result = await db.query('DELETE FROM tickets RETURNING id');
+    await db.query('DELETE FROM ticket_scans WHERE shop_id = $1', [req.shopId]);
+    console.log('Deleted ticket scans for shop', req.shopId);
+
+    const result = await db.query('DELETE FROM tickets WHERE shop_id = $1 RETURNING id', [req.shopId]);
     const deletedCount = result.rows.length;
     console.log(`Deleted ${deletedCount} tickets`);
     
@@ -301,7 +313,10 @@ router.delete('/reset-database', superAdminMiddleware, async (req, res) => {
 router.delete('/:id', authMiddleware, checkLockdown, async (req, res) => {
   try {
     const { id } = req.params;
-    const result = await db.query('DELETE FROM tickets WHERE id = $1 RETURNING id', [id]);
+    const result = await db.query(
+      'DELETE FROM tickets WHERE id = $1 AND shop_id = $2 RETURNING id',
+      [id, req.shopId]
+    );
     
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Ticket not found' });
@@ -328,8 +343,8 @@ router.patch('/:id/status', authMiddleware, async (req, res) => {
     }
 
     const result = await db.query(
-      'UPDATE tickets SET status = $1 WHERE id = $2 RETURNING id, status',
-      [status, id]
+      'UPDATE tickets SET status = $1 WHERE id = $2 AND shop_id = $3 RETURNING id, status',
+      [status, id, req.shopId]
     );
     
     if (result.rows.length === 0) {
@@ -358,8 +373,8 @@ router.put('/:id', authMiddleware, checkLockdown, async (req, res) => {
     }
 
     const result = await db.query(
-      'UPDATE tickets SET name = $1, email = $2 WHERE id = $3 RETURNING *',
-      [name, email || null, id]
+      'UPDATE tickets SET name = $1, email = $2 WHERE id = $3 AND shop_id = $4 RETURNING *',
+      [name, email || null, id, req.shopId]
     );
 
     if (result.rows.length === 0) {
@@ -387,27 +402,33 @@ router.post('/:id/scan-status', authMiddleware, checkLockdown, async (req, res) 
       return res.status(400).json({ error: 'Action must be "mark" or "unmark"' });
     }
 
-    const ticketResult = await db.query('SELECT id FROM tickets WHERE id = $1', [id]);
+    const ticketResult = await db.query(
+      'SELECT id FROM tickets WHERE id = $1 AND shop_id = $2',
+      [id, req.shopId]
+    );
     if (ticketResult.rows.length === 0) {
       return res.status(404).json({ error: 'Ticket not found' });
     }
 
     if (action === 'mark') {
-      const scanCheck = await db.query('SELECT id FROM ticket_scans WHERE ticket_id = $1', [id]);
+      const scanCheck = await db.query(
+        'SELECT id FROM ticket_scans WHERE ticket_id = $1 AND shop_id = $2',
+        [id, req.shopId]
+      );
       if (scanCheck.rows.length > 0) {
         return res.status(400).json({ error: 'Ticket is already marked as scanned' });
       }
 
       await db.query(
-        'INSERT INTO ticket_scans (ticket_id, scan_date, scanned_by_user_id) VALUES ($1, NOW(), $2)',
-        [id, req.user.id]
+        'INSERT INTO ticket_scans (shop_id, ticket_id, scan_date, scanned_by_user_id) VALUES ($1, $2, NOW(), $3)',
+        [req.shopId, id, req.user.id]
       );
 
       const scanResult = await db.query(
         `SELECT ts.scan_date, ts.scanned_by_user_id, u.username as scanned_by_username
          FROM ticket_scans ts LEFT JOIN users u ON ts.scanned_by_user_id = u.id
-         WHERE ts.ticket_id = $1`,
-        [id]
+         WHERE ts.ticket_id = $1 AND ts.shop_id = $2`,
+        [id, req.shopId]
       );
 
       res.json({
@@ -420,7 +441,10 @@ router.post('/:id/scan-status', authMiddleware, checkLockdown, async (req, res) 
         }
       });
     } else {
-      const deleteResult = await db.query('DELETE FROM ticket_scans WHERE ticket_id = $1', [id]);
+      const deleteResult = await db.query(
+        'DELETE FROM ticket_scans WHERE ticket_id = $1 AND shop_id = $2',
+        [id, req.shopId]
+      );
       if (deleteResult.rowCount === 0) {
         return res.status(400).json({ error: 'Ticket was not scanned' });
       }
@@ -440,14 +464,14 @@ router.get('/daily-email-quota', authMiddleware, async (req, res) => {
     todayStart.setHours(0, 0, 0, 0);
     
     const result = await db.query(
-      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE sent_at >= $1 AND success = true',
-      [todayStart]
+      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
+      [req.shopId, todayStart]
     );
-    
+
     const sentToday = parseInt(result.rows[0].sent_today);
     const dailyLimit = 100;
     const remaining = Math.max(0, dailyLimit - sentToday);
-    
+
     res.json({ sentToday, dailyLimit, remaining });
   } catch (error) {
     console.error('Error getting daily email quota:', error);
@@ -464,10 +488,10 @@ router.post('/batch-send-emails', authMiddleware, async (req, res) => {
     todayStart.setHours(0, 0, 0, 0);
     
     const quotaResult = await db.query(
-      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE sent_at >= $1 AND success = true',
-      [todayStart]
+      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
+      [req.shopId, todayStart]
     );
-    
+
     const sentToday = parseInt(quotaResult.rows[0].sent_today);
     const dailyLimit = 100;
     const remaining = Math.max(0, dailyLimit - sentToday);
@@ -482,14 +506,15 @@ router.post('/batch-send-emails', authMiddleware, async (req, res) => {
     
     let query = `SELECT t.id, t.name, t.email, t.uuid, e.name as event_name
                  FROM tickets t
-                 LEFT JOIN events e ON t.event_id = e.id
-                 WHERE (t.email_sent = false OR t.email_sent IS NULL) 
-                 AND t.email IS NOT NULL 
+                 LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+                 WHERE t.shop_id = $1
+                 AND (t.email_sent = false OR t.email_sent IS NULL)
+                 AND t.email IS NOT NULL
                  AND (t.status IS NULL OR t.status = 'valid')`;
-    const params = [];
-    
+    const params = [req.shopId];
+
     if (eventId && eventId !== 'all') {
-      query += ' AND t.event_id = $1';
+      query += ' AND t.event_id = $2';
       params.push(eventId);
     }
     
@@ -539,17 +564,18 @@ router.post('/batch-send-emails', authMiddleware, async (req, res) => {
           to: recipientEmail,
           name: recipientName,
           tickets: ticketsForEmail,
+          shopId: req.shopId,
         });
 
         const ticketIds = group.map(t => t.id);
         await db.query(
-          'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1)',
-          [ticketIds]
+          'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1) AND shop_id = $2',
+          [ticketIds, req.shopId]
         );
 
         await db.query(
-          'INSERT INTO email_send_log (recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4)',
-          [recipientEmail, group[0].id, 'batch_send', true]
+          'INSERT INTO email_send_log (shop_id, recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4, $5)',
+          [req.shopId, recipientEmail, group[0].id, 'batch_send', true]
         );
 
         sentCount++;
@@ -563,8 +589,8 @@ router.post('/batch-send-emails', authMiddleware, async (req, res) => {
         
         try {
           await db.query(
-            'INSERT INTO email_send_log (recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4)',
-            [recipientEmail, group[0].id, 'batch_send', false]
+            'INSERT INTO email_send_log (shop_id, recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4, $5)',
+            [req.shopId, recipientEmail, group[0].id, 'batch_send', false]
           );
         } catch (logError) {
           console.error('Failed to log email failure:', logError);
@@ -588,8 +614,8 @@ router.post('/batch-send-emails', authMiddleware, async (req, res) => {
     }
 
     const updatedQuotaResult = await db.query(
-      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE sent_at >= $1 AND success = true',
-      [todayStart]
+      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
+      [req.shopId, todayStart]
     );
     const updatedSentToday = parseInt(updatedQuotaResult.rows[0].sent_today);
     const updatedRemaining = Math.max(0, dailyLimit - updatedSentToday);
@@ -622,8 +648,8 @@ router.put('/:id/email', authMiddleware, async (req, res) => {
 
   try {
     const ticketResult = await db.query(
-      'SELECT id, email, email_sent FROM tickets WHERE id = $1',
-      [ticketId]
+      'SELECT id, email, email_sent FROM tickets WHERE id = $1 AND shop_id = $2',
+      [ticketId, req.shopId]
     );
 
     if (ticketResult.rows.length === 0) {
@@ -635,15 +661,15 @@ router.put('/:id/email', authMiddleware, async (req, res) => {
     const wasEmailSent = ticket.email_sent;
 
     const result = await db.query(
-      'UPDATE tickets SET email = $1 WHERE id = $2 RETURNING *',
-      [email || null, ticketId]
+      'UPDATE tickets SET email = $1 WHERE id = $2 AND shop_id = $3 RETURNING *',
+      [email || null, ticketId, req.shopId]
     );
 
     let emailStatusChanged = false;
     if (wasEmailSent && oldEmail !== email) {
       await db.query(
-        'UPDATE tickets SET email_sent = false, email_sent_at = NULL WHERE id = $1',
-        [ticketId]
+        'UPDATE tickets SET email_sent = false, email_sent_at = NULL WHERE id = $1 AND shop_id = $2',
+        [ticketId, req.shopId]
       );
       emailStatusChanged = true;
     }
@@ -672,9 +698,9 @@ router.post('/:id/send-email', authMiddleware, async (req, res) => {
     const ticketResult = await db.query(
       `SELECT t.id, t.name, t.email, t.uuid, t.status, e.name as event_name
        FROM tickets t
-       LEFT JOIN events e ON t.event_id = e.id
-       WHERE t.id = $1`,
-      [ticketId]
+       LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+       WHERE t.id = $1 AND t.shop_id = $2`,
+      [ticketId, req.shopId]
     );
 
     if (ticketResult.rows.length === 0) {
@@ -705,17 +731,18 @@ router.post('/:id/send-email', authMiddleware, async (req, res) => {
         uuid: ticket.uuid,
         qrCodeDataUrl,
         event_name: ticket.event_name
-      }]
+      }],
+      shopId: req.shopId
     });
 
     await db.query(
-      'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = $1',
-      [ticketId]
+      'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = $1 AND shop_id = $2',
+      [ticketId, req.shopId]
     );
-    
+
     await db.query(
-      'INSERT INTO email_send_log (recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4)',
-      [ticket.email, ticketId, 'individual_send', true]
+      'INSERT INTO email_send_log (shop_id, recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4, $5)',
+      [req.shopId, ticket.email, ticketId, 'individual_send', true]
     );
 
     res.json({ message: 'Ticket email sent successfully' });
@@ -745,9 +772,9 @@ router.post('/send-order-email', authMiddleware, async (req, res) => {
     const ticketsResult = await db.query(
       `SELECT t.id, t.name, t.email, t.uuid, t.status, e.name as event_name
        FROM tickets t
-       LEFT JOIN events e ON t.event_id = e.id
-       WHERE t.id = ANY($1)`,
-      [ticketIds]
+       LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+       WHERE t.id = ANY($1) AND t.shop_id = $2`,
+      [ticketIds, req.shopId]
     );
 
     if (ticketsResult.rows.length === 0) {
@@ -778,21 +805,20 @@ router.post('/send-order-email', authMiddleware, async (req, res) => {
     await emailService.sendTicketEmail({
       to: customerEmail,
       name: customerName || validTickets[0].name,
-      tickets: ticketsWithQR
+      tickets: ticketsWithQR,
+      shopId: req.shopId
     });
 
     const validTicketIds = validTickets.map(t => t.id);
     await db.query(
-      'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1)',
-      [validTicketIds]
+      'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1) AND shop_id = $2',
+      [validTicketIds, req.shopId]
     );
-    
-    for (const ticket of validTickets) {
-      await db.query(
-        'INSERT INTO email_send_log (recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4)',
-        [customerEmail, ticket.id, 'order_send', true]
-      );
-    }
+
+    await db.query(
+      'INSERT INTO email_send_log (shop_id, recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4, $5)',
+      [req.shopId, customerEmail, validTickets[0].id, 'order_send', true]
+    );
 
     res.json({ message: 'Consolidated email sent successfully', ticketsSent: validTickets.length });
   } catch (error) {

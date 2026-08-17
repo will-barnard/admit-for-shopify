@@ -28,7 +28,7 @@ const validateApiKey = (req, res, next) => {
 // Create tickets for a Shopify order.
 router.post('/create-ticket', validateApiKey, checkLockdown, async (req, res) => {
   try {
-    const result = await orders.processOrderCreate(req.body, { source: 'live' });
+    const result = await orders.processOrderCreate(req.body, { source: 'live', shopId: req.shopId });
 
     switch (result.outcome) {
       case 'invalid':
@@ -80,6 +80,7 @@ function statusChangeRoute({ status, webhookType, describe }) {
         status,
         webhookType,
         source: 'live',
+        shopId: req.shopId,
         extraDetails: describe(req.body),
       });
 
@@ -131,12 +132,14 @@ router.get('/debug/webhooks', authMiddleware, async (req, res) => {
       SELECT id, shopify_order_id, webhook_type, processed, error_message,
              tickets_created, created_at, processed_at
         FROM webhook_logs
+       WHERE shop_id = $1
        ORDER BY created_at DESC
        LIMIT 20
-    `);
+    `, [req.shopId]);
 
     const ticketCounts = await db.query(
-      'SELECT status, COUNT(*) as count FROM tickets GROUP BY status'
+      'SELECT status, COUNT(*) as count FROM tickets WHERE shop_id = $1 GROUP BY status',
+      [req.shopId]
     );
 
     res.json({

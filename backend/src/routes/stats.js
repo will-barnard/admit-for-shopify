@@ -14,12 +14,14 @@ router.get('/', authMiddleware, async (req, res) => {
       `SELECT t.id, t.event_id, t.shopify_order_id, e.name as event_name, e.event_date
        FROM tickets t
        LEFT JOIN events e ON t.event_id = e.id
-       WHERE (t.status IS NULL OR t.status = 'valid')
-         AND (e.archived IS NULL OR e.archived = false)`
+       WHERE t.shop_id = $1
+         AND (t.status IS NULL OR t.status = 'valid')
+         AND (e.archived IS NULL OR e.archived = false)`,
+      [req.shopId]
     );
     const tickets = ticketsResult.rows;
 
-    const scansResult = await db.query('SELECT ticket_id FROM ticket_scans');
+    const scansResult = await db.query('SELECT ticket_id FROM ticket_scans WHERE shop_id = $1', [req.shopId]);
     const scannedTicketIds = new Set(scansResult.rows.map(s => s.ticket_id));
 
     const eventMap = new Map();

@@ -39,16 +39,16 @@ function startOfToday() {
   return d;
 }
 
-async function emailsSentToday() {
+async function emailsSentToday(shopId) {
   const result = await db.query(
-    'SELECT COUNT(*) as sent_today FROM email_send_log WHERE sent_at >= $1 AND success = true',
-    [startOfToday()]
+    'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
+    [shopId, startOfToday()]
   );
   return parseInt(result.rows[0].sent_today, 10);
 }
 
-async function autoSendEmailsEnabled() {
-  const result = await db.query('SELECT auto_send_emails FROM settings LIMIT 1');
+async function autoSendEmailsEnabled(shopId) {
+  const result = await db.query('SELECT auto_send_emails FROM settings WHERE shop_id = $1', [shopId]);
   return result.rows[0]?.auto_send_emails ?? true;
 }
 
@@ -59,12 +59,14 @@ async function autoSendEmailsEnabled() {
  * archived events, so issuing tickets against one produces a ticket that can
  * never be used.
  */
-async function loadSellableEventsBySku() {
+async function loadSellableEventsBySku(shopId) {
   const result = await db.query(
     `SELECT id, name, sku FROM events
-      WHERE active = true
+      WHERE shop_id = $1
+        AND active = true
         AND sku IS NOT NULL
-        AND (archived IS NULL OR archived = false)`
+        AND (archived IS NULL OR archived = false)`,
+    [shopId]
   );
   const bySku = new Map();
   result.rows.forEach((event) => bySku.set(event.sku.toLowerCase(), event));
@@ -86,13 +88,13 @@ async function withQrCode(ticket, eventName) {
 // webhook_logs
 // ---------------------------------------------------------------------------
 
-async function logWebhook({ orderId, payload, type, errorMessage = null, processed = false }) {
+async function logWebhook({ shopId, orderId, payload, type, errorMessage = null, processed = false }) {
   try {
     const result = await db.query(
-      `INSERT INTO webhook_logs (shopify_order_id, webhook_data, processed, error_message, webhook_type, created_at)
-       VALUES ($1, $2, $3, $4, $5, NOW())
+      `INSERT INTO webhook_logs (shop_id, shopify_order_id, webhook_data, processed, error_message, webhook_type, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, NOW())
        RETURNING id`,
-      [asId(orderId), JSON.stringify(payload), processed, errorMessage, type]
+      [shopId, asId(orderId), JSON.stringify(payload), processed, errorMessage, type]
     );
     return result.rows[0].id;
   } catch (error) {
@@ -101,24 +103,27 @@ async function logWebhook({ orderId, payload, type, errorMessage = null, process
   }
 }
 
-async function markWebhookProcessed(webhookLogId, { ticketsCreated = 0, errorMessage = null } = {}) {
+async function markWebhookProcessed(webhookLogId, { shopId, ticketsCreated = 0, errorMessage = null } = {}) {
   if (!webhookLogId) return;
   try {
     await db.query(
       `UPDATE webhook_logs
           SET processed = TRUE, processed_at = NOW(), tickets_created = $1, error_message = $2
-        WHERE id = $3`,
-      [ticketsCreated, errorMessage, webhookLogId]
+        WHERE id = $3 AND shop_id = $4`,
+      [ticketsCreated, errorMessage, webhookLogId, shopId]
     );
   } catch (error) {
     console.error('Failed to update webhook log:', error);
   }
 }
 
-async function markWebhookFailed(webhookLogId, message) {
+async function markWebhookFailed(webhookLogId, message, shopId) {
   if (!webhookLogId) return;
   try {
-    await db.query('UPDATE webhook_logs SET error_message = $1 WHERE id = $2', [message, webhookLogId]);
+    await db.query(
+      'UPDATE webhook_logs SET error_message = $1 WHERE id = $2 AND shop_id = $3',
+      [message, webhookLogId, shopId]
+    );
   } catch (error) {
     console.error('Failed to record webhook error:', error);
   }
@@ -132,7 +137,9 @@ async function markWebhookFailed(webhookLogId, message) {
  * @returns {{outcome: string, ...}} outcome is one of:
  *   'invalid' | 'duplicate' | 'no_ticket_items' | 'created'
  */
-async function processOrderCreate(payload, { source = 'webhook', webhookLogId = null } = {}) {
+async function processOrderCreate(payload, { source = 'webhook', webhookLogId = null, shopId } = {}) {
+  if (!shopId) throw new Error('processOrderCreate requires shopId');
+
   const { line_items: lineItems, customer, id: rawOrderId } = payload || {};
   const orderId = asId(rawOrderId);
 
@@ -146,12 +153,12 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
 
   if (validationError) {
     const logId = webhookLogId
-      || (await logWebhook({ orderId, payload, type: 'order_create', errorMessage: validationError }));
+      || (await logWebhook({ shopId, orderId, payload, type: 'order_create', errorMessage: validationError }));
     return { outcome: 'invalid', error: validationError, webhookLogId: logId };
   }
 
   const logId = webhookLogId
-    || (await logWebhook({ orderId, payload, type: 'order_create' }));
+    || (await logWebhook({ shopId, orderId, payload, type: 'order_create' }));
 
   const customerName = customerNameOf(customer);
   const customerEmail = customer.email || null;
@@ -168,15 +175,15 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
         await db.advisoryXactLock(client, `shopify_order:${orderId}`);
 
         const existing = await client.query(
-          'SELECT id, uuid, shopify_order_id, email_sent FROM tickets WHERE shopify_order_id = $1',
-          [orderId]
+          'SELECT id, uuid, shopify_order_id, email_sent FROM tickets WHERE shopify_order_id = $1 AND shop_id = $2',
+          [orderId, shopId]
         );
         if (existing.rows.length > 0) {
           return { duplicate: true, tickets: existing.rows };
         }
       }
 
-      const eventsBySku = await loadSellableEventsBySku();
+      const eventsBySku = await loadSellableEventsBySku(shopId);
       const ticketLineItems = lineItems.filter((item) => {
         const sku = item.sku?.toLowerCase();
         return sku && eventsBySku.has(sku);
@@ -194,10 +201,10 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
 
         for (let i = 0; i < quantity; i += 1) {
           const inserted = await client.query(
-            `INSERT INTO tickets (event_id, name, email, uuid, shopify_order_id, shopify_line_item_id, email_sent, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, false, NOW())
+            `INSERT INTO tickets (shop_id, event_id, name, email, uuid, shopify_order_id, shopify_line_item_id, email_sent, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW())
              RETURNING *`,
-            [event.id, customerName, customerEmail, uuidv4(), orderId, lineItemId]
+            [shopId, event.id, customerName, customerEmail, uuidv4(), orderId, lineItemId]
           );
           rows.push({ ticket: inserted.rows[0], eventName: event.name });
         }
@@ -206,13 +213,14 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
     });
   } catch (error) {
     console.error('Error creating tickets for order:', error);
-    await markWebhookFailed(logId, error.message || 'Unknown error processing order');
+    await markWebhookFailed(logId, error.message || 'Unknown error processing order', shopId);
     throw error;
   }
 
   if (created.duplicate) {
     console.log(`Duplicate Shopify order ${orderId} - returning existing tickets`);
     await markWebhookProcessed(logId, {
+      shopId,
       ticketsCreated: created.tickets.length,
       errorMessage: 'Duplicate order - tickets already exist',
     });
@@ -220,7 +228,7 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
   }
 
   if (created.tickets.length === 0) {
-    await markWebhookProcessed(logId, { errorMessage: 'No ticket items found in order' });
+    await markWebhookProcessed(logId, { shopId, errorMessage: 'No ticket items found in order' });
     return { outcome: 'no_ticket_items', tickets: [], webhookLogId: logId };
   }
 
@@ -232,6 +240,7 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
   }
 
   const email = await maybeSendOrderEmail({
+    shopId,
     tickets,
     customerName,
     customerEmail,
@@ -239,7 +248,7 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
     sendType: source === 'retry' ? 'shopify_order_retry' : 'shopify_order',
   });
 
-  await markWebhookProcessed(logId, { ticketsCreated: tickets.length });
+  await markWebhookProcessed(logId, { shopId, ticketsCreated: tickets.length });
   console.log(`Created ${tickets.length} ticket(s) from order ${orderId}`);
 
   return { outcome: 'created', tickets, email, webhookLogId: logId };
@@ -253,15 +262,15 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
  * consume 4 units of a 100-message budget. This matches what batch-send in
  * routes/tickets.js already did.
  */
-async function maybeSendOrderEmail({ tickets, customerName, customerEmail, orderId, sendType }) {
+async function maybeSendOrderEmail({ shopId, tickets, customerName, customerEmail, orderId, sendType }) {
   if (tickets.length === 0) return { sent: false, reason: 'no_tickets' };
-  if (!(await autoSendEmailsEnabled())) return { sent: false, reason: 'auto_send_disabled' };
+  if (!(await autoSendEmailsEnabled(shopId))) return { sent: false, reason: 'auto_send_disabled' };
   if (!customerEmail) {
     console.log(`No email on order ${orderId} - tickets created without sending`);
     return { sent: false, reason: 'no_email' };
   }
 
-  const sentToday = await emailsSentToday();
+  const sentToday = await emailsSentToday(shopId);
   if (sentToday >= DAILY_EMAIL_LIMIT) {
     console.log(`Daily email limit reached (${sentToday}/${DAILY_EMAIL_LIMIT}) - order ${orderId} left unsent`);
     await notifyAdmin({
@@ -273,7 +282,7 @@ async function maybeSendOrderEmail({ tickets, customerName, customerEmail, order
   }
 
   try {
-    const sendResult = await sendTicketEmail({ to: customerEmail, name: customerName, tickets });
+    const sendResult = await sendTicketEmail({ to: customerEmail, name: customerName, tickets, shopId });
 
     // sendTicketEmail does not always throw on failure:
     //  - if RESEND_API_KEY is unset it returns { success: false } and sends nothing
@@ -286,12 +295,12 @@ async function maybeSendOrderEmail({ tickets, customerName, customerEmail, order
     }
 
     await db.query(
-      'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1)',
-      [tickets.map((t) => t.id)]
+      'UPDATE tickets SET email_sent = true, email_sent_at = NOW() WHERE id = ANY($1) AND shop_id = $2',
+      [tickets.map((t) => t.id), shopId]
     );
     await db.query(
-      'INSERT INTO email_send_log (recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4)',
-      [customerEmail, tickets[0].id, sendType, true]
+      'INSERT INTO email_send_log (shop_id, recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4, $5)',
+      [shopId, customerEmail, tickets[0].id, sendType, true]
     );
 
     console.log(`Sent consolidated email with ${tickets.length} ticket(s) to ${customerEmail}`);
@@ -300,8 +309,8 @@ async function maybeSendOrderEmail({ tickets, customerName, customerEmail, order
     console.error('Failed to send ticket email:', error);
     try {
       await db.query(
-        'INSERT INTO email_send_log (recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4)',
-        [customerEmail, tickets[0].id, sendType, false]
+        'INSERT INTO email_send_log (shop_id, recipient_email, ticket_id, send_type, success) VALUES ($1, $2, $3, $4, $5)',
+        [shopId, customerEmail, tickets[0].id, sendType, false]
       );
     } catch (logError) {
       console.error('Failed to log email failure:', logError);
@@ -388,22 +397,25 @@ async function processOrderStatusChange({
   source = 'webhook',
   webhookLogId = null,
   extraDetails = '',
+  shopId,
 }) {
+  if (!shopId) throw new Error('processOrderStatusChange requires shopId');
+
   const orderId = asId(payload?.order_id);
-  const logId = webhookLogId || (await logWebhook({ orderId, payload, type: webhookType }));
+  const logId = webhookLogId || (await logWebhook({ shopId, orderId, payload, type: webhookType }));
 
   const ticketsResult = await db.query(
     `SELECT t.id, t.uuid, t.name, t.email, t.status, t.shopify_line_item_id,
-            EXISTS (SELECT 1 FROM ticket_scans ts WHERE ts.ticket_id = t.id) AS scanned
+            EXISTS (SELECT 1 FROM ticket_scans ts WHERE ts.ticket_id = t.id AND ts.shop_id = t.shop_id) AS scanned
        FROM tickets t
-      WHERE t.shopify_order_id = $1
+      WHERE t.shopify_order_id = $1 AND t.shop_id = $2
       ORDER BY t.id`,
-    [orderId]
+    [orderId, shopId]
   );
 
   if (ticketsResult.rows.length === 0) {
     console.log(`No tickets found for order ${orderId}`);
-    await markWebhookProcessed(logId, { errorMessage: 'No tickets found for this order' });
+    await markWebhookProcessed(logId, { shopId, errorMessage: 'No tickets found for this order' });
     return { outcome: 'no_tickets', orderId, webhookLogId: logId };
   }
 
@@ -411,6 +423,7 @@ async function processOrderStatusChange({
 
   if (selection.tickets.length === 0) {
     await markWebhookProcessed(logId, {
+      shopId,
       errorMessage: 'Refund did not match any voidable tickets',
     });
     return { outcome: 'updated', updated: [], orderId, selection, webhookLogId: logId };
@@ -418,8 +431,8 @@ async function processOrderStatusChange({
 
   const ids = selection.tickets.map((t) => t.id);
   const updateResult = await db.query(
-    'UPDATE tickets SET status = $1 WHERE id = ANY($2) RETURNING id, uuid, status',
-    [status, ids]
+    'UPDATE tickets SET status = $1 WHERE id = ANY($2) AND shop_id = $3 RETURNING id, uuid, status',
+    [status, ids, shopId]
   );
 
   const label = STATUS_LABELS[status] || { verb: status, subject: `Order ${status}` };
@@ -439,7 +452,7 @@ async function processOrderStatusChange({
     ticketDetails: `${scopeNote}\n\nThe following tickets have been marked as ${label.verb}:\n\n${ticketList}\n${extraDetails}`,
   });
 
-  await markWebhookProcessed(logId, { ticketsCreated: updateResult.rows.length });
+  await markWebhookProcessed(logId, { shopId, ticketsCreated: updateResult.rows.length });
 
   return {
     outcome: 'updated',

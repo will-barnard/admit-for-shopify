@@ -13,7 +13,7 @@ if (isEmailConfigured) {
 }
 
 // Send ticket email with QR code(s)
-async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, tickets }) {
+async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, tickets, shopId }) {
   // Skip email if not configured
   if (!isEmailConfigured || !resend) {
     console.log('⚠️  Email not configured - skipping email send');
@@ -31,7 +31,10 @@ async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, 
   let logoUrl = null;
   let logoBase64 = null;
   try {
-    const settingsResult = await db.query('SELECT org_name, logo_url FROM settings LIMIT 1');
+    const settingsResult = await db.query(
+      'SELECT org_name, logo_url FROM settings WHERE shop_id = $1',
+      [shopId]
+    );
     if (settingsResult.rows.length > 0) {
       orgName = settingsResult.rows[0].org_name || orgName;
       logoUrl = settingsResult.rows[0].logo_url;
@@ -58,7 +61,10 @@ async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, 
     let eventNames = {};
     if (eventIds.length > 0) {
       try {
-        const eventsResult = await db.query('SELECT id, name, event_date, location FROM events WHERE id = ANY($1)', [eventIds]);
+        const eventsResult = await db.query(
+          'SELECT id, name, event_date, location FROM events WHERE id = ANY($1) AND shop_id = $2',
+          [eventIds, shopId]
+        );
         eventsResult.rows.forEach(e => { eventNames[e.id] = e; });
       } catch (err) {
         console.log('Note: Could not fetch event names');

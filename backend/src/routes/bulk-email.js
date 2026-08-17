@@ -35,7 +35,7 @@ router.post('/test', authMiddleware, superAdminMiddleware, async (req, res) => {
     let orgName = 'Event';
     if (includeLogo) {
       try {
-        const settingsResult = await db.query('SELECT org_name, logo_url FROM settings LIMIT 1');
+        const settingsResult = await db.query('SELECT org_name, logo_url FROM settings WHERE shop_id = $1', [req.shopId]);
         if (settingsResult.rows.length > 0) {
           orgName = settingsResult.rows[0].org_name || orgName;
           const logoPath = settingsResult.rows[0].logo_url;
@@ -121,29 +121,31 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
     // Get recipients - either from explicit email list or by event
     let recipients;
     if (emails && Array.isArray(emails) && emails.length > 0) {
-      const placeholders = emails.map((_, i) => `$${i + 1}`).join(', ');
+      const placeholders = emails.map((_, i) => `$${i + 2}`).join(', ');
       const result = await db.query(
         `SELECT DISTINCT t.email, t.name, e.name as event_name
          FROM tickets t
-         LEFT JOIN events e ON t.event_id = e.id
-         WHERE t.email IN (${placeholders})
+         LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+         WHERE t.shop_id = $1
+         AND t.email IN (${placeholders})
          AND (t.status IS NULL OR t.status = 'valid')
          ORDER BY t.email`,
-        emails
+        [req.shopId, ...emails]
       );
       recipients = result.rows;
     } else {
-      const placeholders = eventIds.map((_, i) => `$${i + 1}`).join(', ');
+      const placeholders = eventIds.map((_, i) => `$${i + 2}`).join(', ');
       const result = await db.query(
         `SELECT DISTINCT t.email, t.name, e.name as event_name
          FROM tickets t
-         LEFT JOIN events e ON t.event_id = e.id
-         WHERE t.event_id IN (${placeholders})
+         LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+         WHERE t.shop_id = $1
+         AND t.event_id IN (${placeholders})
          AND t.email IS NOT NULL
          AND t.email != ''
          AND (t.status IS NULL OR t.status = 'valid')
          ORDER BY t.email`,
-        eventIds
+        [req.shopId, ...eventIds]
       );
       recipients = result.rows;
     }
@@ -157,8 +159,8 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
     todayStart.setHours(0, 0, 0, 0);
     
     const quotaResult = await db.query(
-      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE sent_at >= $1 AND success = true',
-      [todayStart]
+      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
+      [req.shopId, todayStart]
     );
     
     const sentToday = parseInt(quotaResult.rows[0].sent_today);
@@ -185,7 +187,7 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
     let orgName = 'Event';
     if (includeLogo) {
       try {
-        const settingsResult = await db.query('SELECT org_name, logo_url FROM settings LIMIT 1');
+        const settingsResult = await db.query('SELECT org_name, logo_url FROM settings WHERE shop_id = $1', [req.shopId]);
         if (settingsResult.rows.length > 0) {
           orgName = settingsResult.rows[0].org_name || orgName;
           const logoPath = settingsResult.rows[0].logo_url;
@@ -226,8 +228,8 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
         
         // Log successful send
         await db.query(
-          'INSERT INTO email_send_log (recipient_email, send_type, success) VALUES ($1, $2, $3)',
-          [recipient.email, 'bulk_email', true]
+          'INSERT INTO email_send_log (shop_id, recipient_email, send_type, success) VALUES ($1, $2, $3, $4)',
+          [req.shopId, recipient.email, 'bulk_email', true]
         );
         
         sentCount++;
@@ -244,8 +246,8 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
         // Log failed send
         try {
           await db.query(
-            'INSERT INTO email_send_log (recipient_email, send_type, success) VALUES ($1, $2, $3)',
-            [recipient.email, 'bulk_email', false]
+            'INSERT INTO email_send_log (shop_id, recipient_email, send_type, success) VALUES ($1, $2, $3, $4)',
+            [req.shopId, recipient.email, 'bulk_email', false]
           );
         } catch (logError) {
           console.error('Failed to log email failure:', logError);
@@ -278,17 +280,18 @@ router.post('/preview/list', authMiddleware, superAdminMiddleware, async (req, r
       return res.status(400).json({ error: 'At least one event must be selected' });
     }
 
-    const placeholders = eventIds.map((_, i) => `$${i + 1}`).join(', ');
+    const placeholders = eventIds.map((_, i) => `$${i + 2}`).join(', ');
     const result = await db.query(
       `SELECT DISTINCT t.email, t.name, e.name as event_name
        FROM tickets t
-       LEFT JOIN events e ON t.event_id = e.id
-       WHERE t.event_id IN (${placeholders})
+       LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+       WHERE t.shop_id = $1
+       AND t.event_id IN (${placeholders})
        AND t.email IS NOT NULL
        AND t.email != ''
        AND (t.status IS NULL OR t.status = 'valid')
        ORDER BY t.name`,
-      eventIds
+      [req.shopId, ...eventIds]
     );
 
     res.json({ recipients: result.rows });
@@ -307,22 +310,23 @@ router.post('/preview', authMiddleware, superAdminMiddleware, async (req, res) =
       return res.status(400).json({ error: 'At least one event must be selected' });
     }
 
-    const placeholders = eventIds.map((_, i) => `$${i + 1}`).join(', ');
+    const placeholders = eventIds.map((_, i) => `$${i + 2}`).join(', ');
     const query = `
-      SELECT 
+      SELECT
         e.name as event_name,
         t.event_id,
         COUNT(DISTINCT t.email) as count
       FROM tickets t
-      LEFT JOIN events e ON t.event_id = e.id
-      WHERE t.event_id IN (${placeholders})
+      LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+      WHERE t.shop_id = $1
+      AND t.event_id IN (${placeholders})
       AND t.email IS NOT NULL
       AND t.email != ''
       AND (t.status IS NULL OR t.status = 'valid')
       GROUP BY t.event_id, e.name
     `;
 
-    const result = await db.query(query, eventIds);
+    const result = await db.query(query, [req.shopId, ...eventIds]);
     
     const total = result.rows.reduce((sum, row) => sum + parseInt(row.count), 0);
 

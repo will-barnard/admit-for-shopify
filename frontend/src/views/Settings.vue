@@ -215,76 +215,6 @@
         </div>
       </div>
       
-      <div v-if="authStore.user?.role === 'superadmin'" class="settings-card migration-section">
-        <h2>🔄 Database Migration</h2>
-        <p class="hint">Transfer ticket data between instances of this application</p>
-        
-        <!-- Receive Mode Toggle -->
-        <div class="migration-subsection">
-          <h3>Receive Mode</h3>
-          <p class="hint">Enable this mode to allow another instance to send data to this one</p>
-          
-          <div class="receive-mode-toggle">
-            <label class="toggle-label">
-              <input 
-                type="checkbox" 
-                v-model="receiveModeEnabled" 
-                @change="toggleReceiveMode"
-                :disabled="togglingReceiveMode"
-              />
-              <span>{{ receiveModeEnabled ? 'Receive Mode Enabled' : 'Receive Mode Disabled' }}</span>
-            </label>
-          </div>
-          
-          <div v-if="receiveModeEnabled && receiveModeSecret" class="secret-display">
-            <label>Secret Key (required for sending):</label>
-            <div class="secret-key-box">
-              <code>{{ receiveModeSecret }}</code>
-              <button @click="copySecret" class="btn-copy">
-                <font-awesome-icon icon="copy" />
-                Copy
-              </button>
-            </div>
-            <p class="hint">⚠️ Keep this secret key secure. Anyone with it can send data to this instance.</p>
-          </div>
-        </div>
-        
-        <!-- Export/Send Database -->
-        <div class="migration-subsection">
-          <h3>Export Database to Another Instance</h3>
-          <p class="hint">Send all tickets, scans, and supplies to another instance in receive mode</p>
-          
-          <div class="form-group">
-            <label>Target Instance URL</label>
-            <input 
-              type="text" 
-              v-model="exportTargetUrl" 
-              placeholder="https://example.com"
-              :disabled="exporting"
-            />
-            <p class="hint">Enter the root URL of the target instance (e.g., http://192.168.1.100:8080)</p>
-          </div>
-          
-          <div class="form-group">
-            <label>Target Instance Secret Key</label>
-            <input 
-              type="text" 
-              v-model="exportSecretKey" 
-              placeholder="Enter the secret key from the target instance"
-              :disabled="exporting"
-            />
-          </div>
-          
-          <button @click="confirmExportDatabase" class="btn-export-db" :disabled="exporting || !exportTargetUrl || !exportSecretKey">
-            {{ exporting ? 'Sending...' : 'Send Database to Target' }}
-          </button>
-        </div>
-        
-        <div v-if="migrationMessage" :class="['action-message', migrationMessageType]">
-          {{ migrationMessage }}
-        </div>
-      </div>
-      
       <div class="settings-card">
         <h2>Export Ticket Data</h2>
         <p class="hint">Download ticket data as CSV</p>
@@ -365,15 +295,6 @@ export default {
     const lockdownMessage = ref('');
     const lockdownMessageType = ref('');
     
-    // Migration refs
-    const receiveModeEnabled = ref(false);
-    const receiveModeSecret = ref('');
-    const togglingReceiveMode = ref(false);
-    const exportTargetUrl = ref('');
-    const exportSecretKey = ref('');
-    const exporting = ref(false);
-    const migrationMessage = ref('');
-    const migrationMessageType = ref('');
 
     const fetchSettings = async () => {
       try {
@@ -381,10 +302,6 @@ export default {
         const data = response.data;
         
         settings.value = data;
-        
-        // Load receive mode settings
-        receiveModeEnabled.value = data.receive_mode_enabled || false;
-        receiveModeSecret.value = data.receive_mode_secret || '';
         
         // Load lockdown mode setting
         lockdownEnabled.value = data.lockdown_mode || false;
@@ -739,94 +656,6 @@ export default {
       }
     };
 
-    // Migration functions
-    const toggleReceiveMode = async () => {
-      togglingReceiveMode.value = true;
-      migrationMessage.value = '';
-      
-      try {
-        const response = await axios.put('/api/settings/receive-mode', {
-          enabled: receiveModeEnabled.value
-        });
-        
-        receiveModeSecret.value = response.data.receive_mode_secret || '';
-        
-        migrationMessage.value = receiveModeEnabled.value 
-          ? 'Receive mode enabled. Share the secret key with the source instance.'
-          : 'Receive mode disabled.';
-        migrationMessageType.value = 'success';
-        
-        setTimeout(() => {
-          migrationMessage.value = '';
-        }, 10000);
-      } catch (error) {
-        console.error('Error toggling receive mode:', error);
-        migrationMessage.value = error.response?.data?.error || 'Failed to toggle receive mode';
-        migrationMessageType.value = 'error';
-        // Revert toggle
-        receiveModeEnabled.value = !receiveModeEnabled.value;
-      } finally {
-        togglingReceiveMode.value = false;
-      }
-    };
-    
-    const copySecret = () => {
-      navigator.clipboard.writeText(receiveModeSecret.value);
-      migrationMessage.value = 'Secret key copied to clipboard!';
-      migrationMessageType.value = 'success';
-      setTimeout(() => {
-        migrationMessage.value = '';
-      }, 3000);
-    };
-    
-    const confirmExportDatabase = () => {
-      const confirmed = confirm(
-        '⚠️ EXPORT DATABASE WARNING\n\n' +
-        `You are about to send all tickets, scans, and supplies to:\n${exportTargetUrl.value}\n\n` +
-        'The target instance must be in receive mode.\n\n' +
-        'This will transfer all your ticket data to the target instance.\n\n' +
-        'Are you sure you want to proceed?'
-      );
-      
-      if (confirmed) {
-        exportDatabase();
-      }
-    };
-    
-    const exportDatabase = async () => {
-      exporting.value = true;
-      migrationMessage.value = '';
-      
-      try {
-        const response = await axios.post('/api/migration/send', {
-          targetUrl: exportTargetUrl.value,
-          secret: exportSecretKey.value
-        });
-        
-        migrationMessage.value = 
-          `Migration successful! Sent ${response.data.sent.tickets} tickets, ` +
-          `${response.data.sent.scans} scans, ${response.data.sent.supplies} supplies.`;
-        migrationMessageType.value = 'success';
-        
-        // Clear form
-        exportTargetUrl.value = '';
-        exportSecretKey.value = '';
-        
-        setTimeout(() => {
-          migrationMessage.value = '';
-        }, 15000);
-      } catch (error) {
-        console.error('Error exporting database:', error);
-        migrationMessage.value = error.response?.data?.error || 'Failed to export database';
-        if (error.response?.data?.details) {
-          migrationMessage.value += ': ' + error.response.data.details;
-        }
-        migrationMessageType.value = 'error';
-      } finally {
-        exporting.value = false;
-      }
-    };
-
     const showChangePassword = () => {
       isChangePasswordOpen.value = true;
     };
@@ -875,14 +704,6 @@ export default {
       togglingLockdown,
       lockdownMessage,
       lockdownMessageType,
-      receiveModeEnabled,
-      receiveModeSecret,
-      togglingReceiveMode,
-      exportTargetUrl,
-      exportSecretKey,
-      exporting,
-      migrationMessage,
-      migrationMessageType,
       isChangePasswordOpen,
       handleLogoSelect,
       removeLogo,
@@ -894,9 +715,6 @@ export default {
       downloadPostEventReport,
       confirmResetDatabase,
       toggleLockdown,
-      toggleReceiveMode,
-      copySecret,
-      confirmExportDatabase,
       showChangePassword,
       handleLogout
     };
@@ -1445,35 +1263,11 @@ export default {
 }
 
 /* Migration Section Styles */
-.migration-section {
-  border: 2px solid #667eea;
-  background: #f0f4ff;
-}
 
-.migration-section h2 {
-  color: #667eea;
-}
 
-.migration-subsection {
-  margin-bottom: 2rem;
-  padding-bottom: 2rem;
-  border-bottom: 1px solid #d0d0d0;
-}
 
-.migration-subsection:last-of-type {
-  border-bottom: none;
-  margin-bottom: 0;
-}
 
-.migration-subsection h3 {
-  color: #555;
-  font-size: 1.25rem;
-  margin-bottom: 0.5rem;
-}
 
-.receive-mode-toggle {
-  margin: 1.5rem 0;
-}
 
 .toggle-label {
   display: flex;
@@ -1494,38 +1288,9 @@ export default {
   font-size: 1rem;
 }
 
-.secret-display {
-  margin-top: 1.5rem;
-  padding: 1rem;
-  background: white;
-  border-radius: 8px;
-  border: 1px solid #e0e0e0;
-}
 
-.secret-display label {
-  display: block;
-  margin-bottom: 0.5rem;
-  font-weight: 600;
-  color: #555;
-}
 
-.secret-key-box {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  background: #f5f5f5;
-  padding: 1rem;
-  border-radius: 8px;
-  border: 1px solid #d0d0d0;
-}
 
-.secret-key-box code {
-  flex: 1;
-  font-family: 'Courier New', monospace;
-  font-size: 0.875rem;
-  word-break: break-all;
-  color: #333;
-}
 
 .btn-copy {
   background: #667eea;

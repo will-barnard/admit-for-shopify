@@ -21,6 +21,7 @@ const migrationRoutes = require('./routes/migration');
 const webhookRoutes = require('./routes/webhooks');
 const bulkEmailRoutes = require('./routes/bulk-email');
 const eventRoutes = require('./routes/events');
+const shopContext = require('./middleware/shop-context');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -31,6 +32,10 @@ app.use(cors());
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
+// Resolve the tenant for every API request. Runs before the routers so that
+// req.shopId is always populated; see middleware/shop-context.js.
+app.use('/api', shopContext);
+
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/auth', verifierAuthRoutes);
@@ -40,7 +45,7 @@ app.use('/api/user', userRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/stats', statsRoutes);
 app.use('/api/shopify', shopifyRoutes);
-app.use('/api/migration', migrationRoutes);
+app.use('/api/migration', migrationRoutes); // retired - responds 410, see routes/migration.js
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/bulk-email', bulkEmailRoutes);
 app.use('/api/events', eventRoutes);

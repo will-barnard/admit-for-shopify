@@ -250,6 +250,111 @@ async function runMigrations() {
 
     await db.query(`CREATE INDEX IF NOT EXISTS idx_email_send_log_sent_at ON email_send_log(sent_at)`);
 
+    // ---------------------------------------------------------------
+    // Multi-tenancy
+    //
+    // Every tenant-owned row belongs to a shop. Today there is exactly one
+    // shop (the legacy single-tenant install), but the column and the
+    // constraints exist from here on so that adding a second tenant is a data
+    // change rather than a schema migration.
+    //
+    // `users` is deliberately NOT shop-scoped: it is the legacy app-owned auth
+    // system, which a Shopify app replaces with session tokens rather than
+    // partitions. It goes away at cutover.
+    // ---------------------------------------------------------------
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS shops (
+        id SERIAL PRIMARY KEY,
+        domain VARCHAR(255) UNIQUE NOT NULL,
+        access_token TEXT,
+        access_token_expires_at TIMESTAMP,
+        refresh_token TEXT,
+        refresh_token_expires_at TIMESTAMP,
+        scopes TEXT,
+        installed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        uninstalled_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('✓ Shops table created');
+
+    // The tenant that owns all pre-existing data. Overridable so a real
+    // myshopify.com domain can be used from the start on a fresh install.
+    const legacyDomain = process.env.DEFAULT_SHOP_DOMAIN || 'legacy.local';
+    await db.query(
+      `INSERT INTO shops (domain) VALUES ($1) ON CONFLICT (domain) DO NOTHING`,
+      [legacyDomain]
+    );
+    const legacyShop = await db.query('SELECT id FROM shops WHERE domain = $1', [legacyDomain]);
+    const legacyShopId = legacyShop.rows[0].id;
+    console.log(`✓ Default shop ensured: ${legacyDomain} (id ${legacyShopId})`);
+
+    // settings is one row per shop. Collapse any historical duplicates first,
+    // otherwise the unique constraint below cannot be created.
+    await db.query(`
+      DELETE FROM settings a USING settings b
+       WHERE a.id > b.id
+    `);
+
+    const tenantTables = ['events', 'tickets', 'ticket_scans', 'settings', 'webhook_logs', 'email_send_log'];
+    for (const table of tenantTables) {
+      await db.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name = '${table}' AND column_name = 'shop_id'
+          ) THEN
+            ALTER TABLE ${table} ADD COLUMN shop_id INTEGER REFERENCES shops(id) ON DELETE CASCADE;
+          END IF;
+        END $$;
+      `);
+      await db.query(`UPDATE ${table} SET shop_id = $1 WHERE shop_id IS NULL`, [legacyShopId]);
+      await db.query(`ALTER TABLE ${table} ALTER COLUMN shop_id SET NOT NULL`);
+      await db.query(`CREATE INDEX IF NOT EXISTS idx_${table}_shop_id ON ${table}(shop_id)`);
+    }
+    console.log('✓ shop_id backfilled and enforced on ' + tenantTables.join(', '));
+
+    // Ensure a settings row exists for the default shop.
+    await db.query(
+      `INSERT INTO settings (shop_id) SELECT $1
+        WHERE NOT EXISTS (SELECT 1 FROM settings WHERE shop_id = $1)`,
+      [legacyShopId]
+    );
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'settings_shop_id_key'
+        ) THEN
+          ALTER TABLE settings ADD CONSTRAINT settings_shop_id_key UNIQUE (shop_id);
+        END IF;
+      END $$;
+    `);
+    console.log('✓ One settings row per shop enforced');
+
+    // events.sku was globally unique, which would stop two merchants from ever
+    // using the same SKU string. It must be unique per shop instead.
+    await db.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'events_sku_key') THEN
+          ALTER TABLE events DROP CONSTRAINT events_sku_key;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'events_shop_id_sku_key') THEN
+          ALTER TABLE events ADD CONSTRAINT events_shop_id_sku_key UNIQUE (shop_id, sku);
+        END IF;
+      END $$;
+    `);
+    console.log('✓ events.sku is now unique per shop');
+
+    // tickets.uuid stays GLOBALLY unique on purpose: it is a random UUID and
+    // GET /api/verify/:uuid looks it up without knowing the shop up front.
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_tickets_shop_created ON tickets(shop_id, created_at DESC)`);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_events_shop_active ON events(shop_id, active, archived)`);
+
     console.log('Migrations completed successfully!');
     process.exit(0);
   } catch (error) {

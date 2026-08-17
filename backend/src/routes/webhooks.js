@@ -10,12 +10,12 @@ router.get('/', superAdminMiddleware, async (req, res) => {
   try {
     const { processed, limit = 50, offset = 0 } = req.query;
     
-    let query = 'SELECT id, shopify_order_id, processed, created_at, processed_at, error_message, tickets_created, webhook_type FROM webhook_logs';
-    const params = [];
-    
+    let query = 'SELECT id, shopify_order_id, processed, created_at, processed_at, error_message, tickets_created, webhook_type FROM webhook_logs WHERE shop_id = $1';
+    const params = [req.shopId];
+
     // Filter by processed status if specified
     if (processed !== undefined) {
-      query += ' WHERE processed = $1';
+      query += ' AND processed = $2';
       params.push(processed === 'true');
     }
     
@@ -25,11 +25,13 @@ router.get('/', superAdminMiddleware, async (req, res) => {
     const result = await db.query(query, params);
     
     // Get total count
-    let countQuery = 'SELECT COUNT(*) FROM webhook_logs';
+    let countQuery = 'SELECT COUNT(*) FROM webhook_logs WHERE shop_id = $1';
+    const countParams = [req.shopId];
     if (processed !== undefined) {
-      countQuery += ' WHERE processed = $1';
+      countQuery += ' AND processed = $2';
+      countParams.push(processed === 'true');
     }
-    const countResult = await db.query(countQuery, processed !== undefined ? [processed === 'true'] : []);
+    const countResult = await db.query(countQuery, countParams);
     
     res.json({
       logs: result.rows,
@@ -49,14 +51,14 @@ router.get('/:id', superAdminMiddleware, async (req, res) => {
     const { id } = req.params;
     
     const result = await db.query(
-      'SELECT * FROM webhook_logs WHERE id = $1',
-      [id]
+      'SELECT * FROM webhook_logs WHERE id = $1 AND shop_id = $2',
+      [id, req.shopId]
     );
-    
+
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Webhook log not found' });
     }
-    
+
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Error fetching webhook log:', error);
@@ -68,14 +70,15 @@ router.get('/:id', superAdminMiddleware, async (req, res) => {
 router.get('/stats/summary', superAdminMiddleware, async (req, res) => {
   try {
     const stats = await db.query(`
-      SELECT 
+      SELECT
         COUNT(*) as total_webhooks,
         COUNT(*) FILTER (WHERE processed = TRUE) as processed_webhooks,
         COUNT(*) FILTER (WHERE processed = FALSE) as unprocessed_webhooks,
         COUNT(*) FILTER (WHERE error_message IS NOT NULL) as webhooks_with_errors,
         SUM(tickets_created) as total_tickets_created
       FROM webhook_logs
-    `);
+      WHERE shop_id = $1
+    `, [req.shopId]);
     
     res.json(stats.rows[0]);
   } catch (error) {
@@ -94,7 +97,10 @@ router.post('/:id/retry', superAdminMiddleware, checkLockdown, async (req, res) 
   const { webhook_type: overrideWebhookType } = req.body;
 
   try {
-    const webhookResult = await db.query('SELECT * FROM webhook_logs WHERE id = $1', [id]);
+    const webhookResult = await db.query(
+      'SELECT * FROM webhook_logs WHERE id = $1 AND shop_id = $2',
+      [id, req.shopId]
+    );
     if (webhookResult.rows.length === 0) {
       return res.status(404).json({ error: 'Webhook log not found' });
     }
@@ -138,13 +144,15 @@ router.post('/:id/retry', superAdminMiddleware, checkLockdown, async (req, res) 
     await db.query(
       `UPDATE webhook_logs
           SET processed = FALSE, error_message = NULL, processed_at = NULL, tickets_created = NULL
-        WHERE id = $1`,
-      [id]
+        WHERE id = $1 AND shop_id = $2`,
+      [id, req.shopId]
     );
 
     let result;
     if (webhookType === 'order_create') {
-      result = await orders.processOrderCreate(webhookData, { source: 'retry', webhookLogId: id });
+      result = await orders.processOrderCreate(webhookData, {
+        source: 'retry', webhookLogId: id, shopId: req.shopId,
+      });
     } else {
       const status = { refund: 'refunded', cancel: 'cancelled', chargeback: 'chargeback' }[webhookType];
       result = await orders.processOrderStatusChange({
@@ -153,11 +161,15 @@ router.post('/:id/retry', superAdminMiddleware, checkLockdown, async (req, res) 
         webhookType,
         source: 'retry',
         webhookLogId: id,
+        shopId: req.shopId,
       });
     }
 
     if (overrideWebhookType && overrideWebhookType !== webhook.webhook_type) {
-      await db.query('UPDATE webhook_logs SET webhook_type = $1 WHERE id = $2', [webhookType, id]);
+      await db.query(
+        'UPDATE webhook_logs SET webhook_type = $1 WHERE id = $2 AND shop_id = $3',
+        [webhookType, id, req.shopId]
+      );
       console.log(`Updated webhook ${id} type from ${webhook.webhook_type} to ${webhookType}`);
     }
 
@@ -172,7 +184,7 @@ router.post('/:id/retry', superAdminMiddleware, checkLockdown, async (req, res) 
     });
   } catch (error) {
     console.error('Error retrying webhook:', error);
-    await orders.markWebhookFailed(id, `Retry failed: ${error.message}`);
+    await orders.markWebhookFailed(id, `Retry failed: ${error.message}`, req.shopId);
     res.status(500).json({
       error: 'Failed to retry webhook processing',
       details: error.message,

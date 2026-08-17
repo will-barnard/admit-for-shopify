@@ -47,7 +47,8 @@ const PUBLIC_SETTINGS_COLUMNS = ['org_name', 'logo_url'];
 router.get('/', async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT ${PUBLIC_SETTINGS_COLUMNS.join(', ')} FROM settings LIMIT 1`
+      `SELECT ${PUBLIC_SETTINGS_COLUMNS.join(', ')} FROM settings WHERE shop_id = $1`,
+      [req.shopId]
     );
     if (result.rows.length === 0) {
       return res.json({ org_name: 'My Organization', logo_url: null });
@@ -63,7 +64,7 @@ router.get('/', async (req, res) => {
 // receive_mode_secret is only returned to superadmins.
 router.get('/admin', auth, async (req, res) => {
   try {
-    const result = await db.query('SELECT * FROM settings LIMIT 1');
+    const result = await db.query('SELECT * FROM settings WHERE shop_id = $1', [req.shopId]);
     if (result.rows.length === 0) {
       return res.json({
         id: 1,
@@ -93,21 +94,18 @@ router.put('/', auth, async (req, res) => {
     const { org_name, auto_send_emails, timezone } = req.body;
     
     // Check if settings exist
-    const checkResult = await db.query('SELECT * FROM settings LIMIT 1');
-    
-    if (checkResult.rows.length === 0) {
-      const result = await db.query(
-        'INSERT INTO settings (org_name, auto_send_emails, timezone, updated_at) VALUES ($1, $2, $3, NOW()) RETURNING *',
-        [org_name, auto_send_emails !== undefined ? auto_send_emails : true, timezone || 'America/Chicago']
-      );
-      res.json(result.rows[0]);
-    } else {
-      const result = await db.query(
-        'UPDATE settings SET org_name = $1, auto_send_emails = $2, timezone = $3, updated_at = NOW() WHERE id = $4 RETURNING *',
-        [org_name, auto_send_emails !== undefined ? auto_send_emails : true, timezone || 'America/Chicago', checkResult.rows[0].id]
-      );
-      res.json(result.rows[0]);
-    }
+    const result = await db.query(
+      `INSERT INTO settings (shop_id, org_name, auto_send_emails, timezone, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (shop_id) DO UPDATE
+          SET org_name = EXCLUDED.org_name,
+              auto_send_emails = EXCLUDED.auto_send_emails,
+              timezone = EXCLUDED.timezone,
+              updated_at = NOW()
+       RETURNING *`,
+      [req.shopId, org_name, auto_send_emails !== undefined ? auto_send_emails : true, timezone || 'America/Chicago']
+    );
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Error updating settings:', error);
     res.status(500).json({ error: 'Failed to update settings' });
@@ -124,31 +122,25 @@ router.post('/logo', auth, upload.single('logo'), async (req, res) => {
     const logoUrl = `/uploads/logos/${req.file.filename}`;
     
     // Check if settings exist
-    const checkResult = await db.query('SELECT * FROM settings LIMIT 1');
-    
-    if (checkResult.rows.length === 0) {
-      // Insert new settings with logo
-      const result = await db.query(
-        'INSERT INTO settings (org_name, logo_url, updated_at) VALUES ($1, $2, NOW()) RETURNING *',
-        ['My Organization', logoUrl]
-      );
-      res.json(result.rows[0]);
-    } else {
-      // Delete old logo if exists
-      if (checkResult.rows[0].logo_url) {
-        const oldLogoPath = path.join(__dirname, '../..', checkResult.rows[0].logo_url);
-        if (fs.existsSync(oldLogoPath)) {
-          fs.unlinkSync(oldLogoPath);
-        }
+    const checkResult = await db.query('SELECT * FROM settings WHERE shop_id = $1', [req.shopId]);
+
+    // Remove the previous logo file if there was one
+    if (checkResult.rows[0]?.logo_url) {
+      const oldLogoPath = path.join(__dirname, '../..', checkResult.rows[0].logo_url);
+      if (fs.existsSync(oldLogoPath)) {
+        fs.unlinkSync(oldLogoPath);
       }
-      
-      // Update with new logo
-      const result = await db.query(
-        'UPDATE settings SET logo_url = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
-        [logoUrl, checkResult.rows[0].id]
-      );
-      res.json(result.rows[0]);
     }
+
+    const result = await db.query(
+      `INSERT INTO settings (shop_id, org_name, logo_url, updated_at)
+       VALUES ($1, 'My Organization', $2, NOW())
+       ON CONFLICT (shop_id) DO UPDATE
+          SET logo_url = EXCLUDED.logo_url, updated_at = NOW()
+       RETURNING *`,
+      [req.shopId, logoUrl]
+    );
+    res.json(result.rows[0]);
   } catch (error) {
     console.error('Error uploading logo:', error);
     res.status(500).json({ error: 'Failed to upload logo' });
@@ -158,8 +150,8 @@ router.post('/logo', auth, upload.single('logo'), async (req, res) => {
 // Delete logo
 router.delete('/logo', auth, async (req, res) => {
   try {
-    const result = await db.query('SELECT * FROM settings LIMIT 1');
-    
+    const result = await db.query('SELECT * FROM settings WHERE shop_id = $1', [req.shopId]);
+
     if (result.rows.length > 0 && result.rows[0].logo_url) {
       // Delete file
       const logoPath = path.join(__dirname, '../..', result.rows[0].logo_url);
@@ -169,8 +161,8 @@ router.delete('/logo', auth, async (req, res) => {
       
       // Update database
       await db.query(
-        'UPDATE settings SET logo_url = NULL, updated_at = NOW() WHERE id = $1',
-        [result.rows[0].id]
+        'UPDATE settings SET logo_url = NULL, updated_at = NOW() WHERE shop_id = $1',
+        [req.shopId]
       );
     }
     
@@ -187,12 +179,12 @@ router.put('/receive-mode', superAdminMiddleware, async (req, res) => {
     const { enabled } = req.body;
     
     // Get current settings
-    const checkResult = await db.query('SELECT * FROM settings LIMIT 1');
-    
+    const checkResult = await db.query('SELECT * FROM settings WHERE shop_id = $1', [req.shopId]);
+
     if (checkResult.rows.length === 0) {
       return res.status(404).json({ error: 'Settings not found' });
     }
-    
+
     let secret = checkResult.rows[0].receive_mode_secret;
     
     // Generate new secret if enabling and no secret exists
@@ -206,8 +198,8 @@ router.put('/receive-mode', superAdminMiddleware, async (req, res) => {
     }
     
     const result = await db.query(
-      'UPDATE settings SET receive_mode_enabled = $1, receive_mode_secret = $2, updated_at = NOW() WHERE id = $3 RETURNING receive_mode_enabled, receive_mode_secret',
-      [enabled, secret, checkResult.rows[0].id]
+      'UPDATE settings SET receive_mode_enabled = $1, receive_mode_secret = $2, updated_at = NOW() WHERE shop_id = $3 RETURNING receive_mode_enabled, receive_mode_secret',
+      [enabled, secret, req.shopId]
     );
     
     console.log(`Receive mode ${enabled ? 'enabled' : 'disabled'}`);
@@ -224,16 +216,14 @@ router.put('/lockdown-mode', superAdminMiddleware, async (req, res) => {
     const { enabled } = req.body;
     
     // Get current settings
-    const checkResult = await db.query('SELECT * FROM settings LIMIT 1');
-    
-    if (checkResult.rows.length === 0) {
+    const result = await db.query(
+      'UPDATE settings SET lockdown_mode = $1, updated_at = NOW() WHERE shop_id = $2 RETURNING lockdown_mode',
+      [enabled, req.shopId]
+    );
+
+    if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Settings not found' });
     }
-    
-    const result = await db.query(
-      'UPDATE settings SET lockdown_mode = $1, updated_at = NOW() WHERE id = $2 RETURNING lockdown_mode',
-      [enabled, checkResult.rows[0].id]
-    );
     
     console.log(`🔒 Lockdown mode ${enabled ? 'ENABLED - Database is now READ-ONLY' : 'DISABLED - Normal operations resumed'}`);
     res.json(result.rows[0]);
@@ -262,10 +252,10 @@ router.get('/export-no-email-tickets', auth, async (req, res) => {
         CASE WHEN ts.ticket_id IS NOT NULL THEN 'Yes' ELSE 'No' END as scanned
       FROM tickets t
       LEFT JOIN events e ON t.event_id = e.id
-      LEFT JOIN ticket_scans ts ON t.id = ts.ticket_id
-      WHERE t.email IS NULL
+      LEFT JOIN ticket_scans ts ON t.id = ts.ticket_id AND ts.shop_id = t.shop_id
+      WHERE t.shop_id = $1 AND t.email IS NULL
       ORDER BY t.created_at DESC
-    `);
+    `, [req.shopId]);
 
     // Convert to CSV
     const tickets = result.rows;
