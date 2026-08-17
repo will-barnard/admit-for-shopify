@@ -35,6 +35,14 @@ services:
       ADMIN_EMAIL: ${ADMIN_EMAIL}
       SHOPIFY_API_KEY: ${SHOPIFY_API_KEY}
       FRONTEND_URL: ${FRONTEND_URL}
+      # Shopify app (custom distribution). If CLIENT_ID/SECRET are empty the
+      # Shopify integration stays dormant and the legacy Flow endpoints still work.
+      SHOPIFY_APP_CLIENT_ID: ${SHOPIFY_APP_CLIENT_ID}
+      SHOPIFY_APP_CLIENT_SECRET: ${SHOPIFY_APP_CLIENT_SECRET}
+      SHOPIFY_APP_URL: ${SHOPIFY_APP_URL}
+      SHOPIFY_API_VERSION: ${SHOPIFY_API_VERSION}
+      SHOPIFY_SCOPES: ${SHOPIFY_SCOPES}
+      DEFAULT_SHOP_DOMAIN: ${DEFAULT_SHOP_DOMAIN}
     expose:
       - "3000"
     depends_on:

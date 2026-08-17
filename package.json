@@ -1,0 +1,13 @@
+{
+  "name": "admit",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Event ticket manager - Shopify app configuration root. Application code lives in backend/, frontend/ and verifier/.",
+  "scripts": {
+    "shopify:deploy": "shopify app deploy",
+    "shopify:info": "shopify app info"
+  },
+  "devDependencies": {
+    "@shopify/cli": "^3"
+  }
+}
