@@ -58,6 +58,8 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      args:
+        VITE_SHOPIFY_API_KEY: ${SHOPIFY_APP_CLIENT_ID}
     restart: unless-stopped
     expose:
       - "80"

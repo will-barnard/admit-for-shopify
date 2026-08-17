@@ -86,15 +86,21 @@ const router = createRouter({
 
 router.beforeEach((to, from, next) => {
   const authStore = useAuthStore();
-  
-  // Initialize auth headers if token exists
+
   authStore.initAuth();
-  
+
+  // In the Shopify admin there is no login page - the merchant is already
+  // authenticated by Shopify and the session token proves it per request.
+  if (authStore.isShopifyEmbedded) {
+    if (to.path === '/login') return next('/');
+    return next();
+  }
+
   if (to.meta.requiresAuth && !authStore.isAuthenticated) {
     next('/login');
   } else if (to.path === '/login' && authStore.isAuthenticated) {
     next('/');
-  } else if (to.meta.requiresSuperAdmin && authStore.user?.role !== 'superadmin') {
+  } else if (to.meta.requiresSuperAdmin && authStore.effectiveRole !== 'superadmin') {
     next('/');
   } else {
     next();
