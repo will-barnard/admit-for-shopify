@@ -1,0 +1,71 @@
+# Shopify app configuration.
+#
+# Distribution: CUSTOM (single store). Chosen in the Dev Dashboard when the app
+# record is created, and IRREVERSIBLE - a custom app cannot become a public App
+# Store app. Going public means a second app record sharing this codebase, which
+# is why the schema is multi-tenant already.
+#
+# client_id comes from the Dev Dashboard (dev.shopify.com/dashboard) once the
+# app record exists. `shopify app config link` will fill it in.
+
+client_id = "REPLACE_WITH_CLIENT_ID_FROM_DEV_DASHBOARD"
+name = "admit"
+handle = "admit"
+application_url = "https://REPLACE_WITH_APP_DOMAIN"
+embedded = true
+
+[access_scopes]
+# read_orders is the only scope needed for what this app does today. It is what
+# permits the webhook subscriptions below.
+#
+# Deliberately NOT requested:
+#   read_customers   - customer name and email arrive inside the order payload;
+#                      the Customer resource is never queried.
+#   read_all_orders  - separately gated by Shopify, and only buys orders older
+#                      than 60 days, which webhook-driven capture never needs.
+#
+# Add later, only alongside the feature that needs them:
+#   read_products    - to pick a product/variant in the admin instead of typing a SKU
+#   write_app_proxy  - to serve a ticket page under the merchant's own domain
+scopes = "read_orders"
+
+# false enables Shopify managed installation: Shopify performs the install and
+# any scope updates on `shopify app deploy`, with no OAuth redirect to implement.
+use_legacy_install_flow = false
+
+[auth]
+# Only used by the legacy authorization code grant. Token exchange does not need
+# it at runtime, but at least one entry is required before an app can be public.
+redirect_urls = [ "https://REPLACE_WITH_APP_DOMAIN/api/shopify/auth/callback" ]
+
+[webhooks]
+api_version = "2026-07"
+
+  [[webhooks.subscriptions]]
+  topics = [ "orders/create" ]
+  uri = "/api/shopify/webhooks"
+
+  [[webhooks.subscriptions]]
+  topics = [ "orders/cancelled" ]
+  uri = "/api/shopify/webhooks"
+
+  [[webhooks.subscriptions]]
+  topics = [ "refunds/create" ]
+  uri = "/api/shopify/webhooks"
+
+  [[webhooks.subscriptions]]
+  topics = [ "disputes/create" ]
+  uri = "/api/shopify/webhooks"
+
+  [[webhooks.subscriptions]]
+  topics = [ "app/uninstalled" ]
+  uri = "/api/shopify/webhooks"
+
+# Mandatory compliance webhooks (customers/data_request, customers/redact,
+# shop/redact) are required for App Store apps only, so they are omitted here.
+# They must be added, with handlers, before any public submission.
+
+[build]
+# Keep false in production: `shopify app dev` would otherwise overwrite the live
+# application_url with an ephemeral tunnel URL.
+automatically_update_urls_on_dev = false

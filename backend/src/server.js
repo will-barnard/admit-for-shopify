@@ -22,6 +22,8 @@ const webhookRoutes = require('./routes/webhooks');
 const bulkEmailRoutes = require('./routes/bulk-email');
 const eventRoutes = require('./routes/events');
 const shopContext = require('./middleware/shop-context');
+const shopifyAuth = require('./middleware/shopify-auth');
+const shopifyWebhookRoutes = require('./routes/shopify-webhooks');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,11 +31,18 @@ const PORT = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 
+// Shopify webhooks MUST be mounted before express.json(): HMAC verification
+// needs the raw, unparsed body. Once express.json() has parsed and
+// re-serialised it, the digest no longer matches.
+app.use('/api/shopify/webhooks', express.raw({ type: '*/*', limit: '5mb' }), shopifyWebhookRoutes);
+
 app.use(express.json());
 app.use('/uploads', express.static('uploads'));
 
-// Resolve the tenant for every API request. Runs before the routers so that
-// req.shopId is always populated; see middleware/shop-context.js.
+// Identity, then tenant. shopifyAuth sets req.shopDomain from an App Bridge
+// session token when there is one; shopContext turns that into req.shopId, and
+// falls back to the single default shop for legacy JWT auth.
+app.use('/api', shopifyAuth);
 app.use('/api', shopContext);
 
 // Routes

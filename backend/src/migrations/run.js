@@ -250,6 +250,26 @@ async function runMigrations() {
 
     await db.query(`CREATE INDEX IF NOT EXISTS idx_email_send_log_sent_at ON email_send_log(sent_at)`);
 
+    // Shopify webhook delivery id, used to deduplicate. Shopify documents
+    // X-Shopify-Webhook-Id as a unique composite key per delivery and retries
+    // 8 times over 4 hours, so the same delivery can legitimately arrive twice.
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'webhook_logs' AND column_name = 'delivery_id'
+        ) THEN
+          ALTER TABLE webhook_logs ADD COLUMN delivery_id VARCHAR(255);
+        END IF;
+      END $$;
+    `);
+    await db.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_logs_delivery_id
+         ON webhook_logs(delivery_id) WHERE delivery_id IS NOT NULL`
+    );
+    console.log('\u2713 Webhook delivery_id ensured');
+
     // ---------------------------------------------------------------
     // Multi-tenancy
     //
