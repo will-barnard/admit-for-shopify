@@ -1,5 +1,8 @@
 {
   "public_service": "frontend",
   "public_port": 80,
-  "stateful_services": ["db"]
+  "health_check": "/",
+  "stateful_services": [
+    "db"
+  ]
 }

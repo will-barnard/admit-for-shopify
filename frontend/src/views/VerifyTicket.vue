@@ -23,31 +23,68 @@
       <p class="message">This ticket has been marked as used.</p>
     </div>
 
-    <div v-else-if="status === 'already_used'" class="verify-card warning">
-      <div class="icon">⚠️</div>
+    <div v-else-if="status === 'already_scanned'" class="verify-card warning">
+      <div class="icon">!</div>
       <h1>Ticket Already Used</h1>
       <div class="ticket-info">
         <p><strong>Name:</strong> {{ ticketData.name }}</p>
+        <p v-if="ticketData.eventName"><strong>Event:</strong> {{ ticketData.eventName }}</p>
+        <p v-if="scannedOn"><strong>Scanned:</strong> {{ scannedOn }}</p>
       </div>
       <p class="message">This ticket has already been scanned and used.</p>
     </div>
 
+    <div v-else-if="status === 'archived'" class="verify-card warning">
+      <div class="icon">!</div>
+      <h1>Event Archived</h1>
+      <div class="ticket-info">
+        <p v-if="ticketData.eventName"><strong>Event:</strong> {{ ticketData.eventName }}</p>
+      </div>
+      <p class="message">This event has been archived. Tickets can no longer be scanned.</p>
+    </div>
+
+    <div v-else-if="voidedStatuses.includes(status)" class="verify-card error">
+      <div class="icon">X</div>
+      <h1>Ticket {{ statusLabel }}</h1>
+      <div class="ticket-info">
+        <p><strong>Name:</strong> {{ ticketData.name }}</p>
+        <p v-if="ticketData.eventName"><strong>Event:</strong> {{ ticketData.eventName }}</p>
+      </div>
+      <p class="message">This ticket is no longer valid and cannot be used for entry.</p>
+    </div>
+
     <div v-else-if="status === 'invalid'" class="verify-card error">
-      <div class="icon">❌</div>
+      <div class="icon">X</div>
       <h1>Invalid Ticket</h1>
       <p class="message">This ticket could not be found in our system.</p>
     </div>
 
+    <div v-else-if="status === 'auth_required'" class="verify-card warning">
+      <div class="icon">!</div>
+      <h1>Staff Sign-in Required</h1>
+      <p class="message">
+        This ticket can only be checked in by event staff. If you're an attendee,
+        please present this QR code at the entrance and a staff member will scan it.
+      </p>
+    </div>
+
+    <div v-else-if="status === 'locked'" class="verify-card warning">
+      <div class="icon">!</div>
+      <h1>Check-in Paused</h1>
+      <p class="message">Ticket scanning is temporarily disabled. Please try again shortly.</p>
+    </div>
+
     <div v-else class="verify-card error">
-      <div class="icon">❌</div>
+      <div class="icon">X</div>
       <h1>Error</h1>
       <p class="message">An error occurred while verifying the ticket.</p>
     </div>
+
   </div>
 </template>
 
 <script>
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useRoute } from 'vue-router';
 import axios from 'axios';
 
@@ -58,6 +95,7 @@ export default {
     
     const loading = ref(true);
     const status = ref('');
+    const scannedOn = ref('');
     const ticketData = ref({
       eventName: '',
       eventDate: '',
@@ -65,26 +103,53 @@ export default {
       name: '',
     });
 
+    // Statuses that mean "this ticket exists but is void". Must stay in sync
+    // with the valid_ticket_status CHECK constraint in migrations/run.js.
+    const voidedStatuses = ['refunded', 'cancelled', 'chargeback', 'invalid_ticket'];
+
+    const statusLabel = computed(() => {
+      const labels = {
+        refunded: 'Refunded',
+        cancelled: 'Cancelled',
+        chargeback: 'Voided',
+      };
+      return labels[status.value] || 'Not Valid';
+    });
+
+    const applyTicketData = (data) => {
+      if (!data) return;
+      if (data.name) ticketData.value.name = data.name;
+      ticketData.value.eventName = data.eventName || ticketData.value.eventName;
+      ticketData.value.eventDate = data.eventDate || '';
+      ticketData.value.location = data.location || '';
+      if (data.scannedOn) {
+        scannedOn.value = new Date(data.scannedOn).toLocaleString();
+      }
+    };
+
     const verifyTicket = async () => {
       const uuid = route.params.uuid;
-      
+
       try {
         const response = await axios.get(`/api/verify/${uuid}`);
         status.value = response.data.status;
-        
-        if (response.data.name) {
-          ticketData.value.eventName = response.data.eventName || '';
-          ticketData.value.eventDate = response.data.eventDate || '';
-          ticketData.value.location = response.data.location || '';
-          ticketData.value.name = response.data.name;
-        }
+        applyTicketData(response.data);
       } catch (error) {
-        if (error.response?.data?.status) {
-          status.value = error.response.data.status;
-          if (error.response.data.name) {
-            ticketData.value.name = error.response.data.name;
-            ticketData.value.eventName = error.response.data.eventName || '';
-          }
+        const httpStatus = error.response?.status;
+        const body = error.response?.data;
+
+        if (body?.status) {
+          // The API reports the ticket's own state (already_scanned, archived,
+          // refunded, cancelled, chargeback, invalid) in the error body.
+          status.value = body.status;
+          applyTicketData(body);
+        } else if (httpStatus === 401) {
+          // GET /api/verify/:uuid requires authentication, but this page is a
+          // public route - it is the QR code target. An attendee opening their
+          // own ticket link lands here.
+          status.value = 'auth_required';
+        } else if (httpStatus === 423) {
+          status.value = 'locked';
         } else {
           status.value = 'error';
         }
@@ -100,6 +165,9 @@ export default {
     return {
       loading,
       status,
+      statusLabel,
+      voidedStatuses,
+      scannedOn,
       ticketData,
     };
   },
