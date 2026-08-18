@@ -1,6 +1,6 @@
 const express = require('express');
-const { Resend } = require('resend');
 const db = require('../config/database');
+const { sendViaResend } = require('../services/email');
 const authMiddleware = require('../middleware/auth');
 const superAdminMiddleware = require('../middleware/superadmin');
 
@@ -10,12 +10,7 @@ const router = express.Router();
 const lastSendTimes = new Map();
 const RATE_LIMIT_MS = 60000; // 1 minute between bulk sends
 
-// Create Resend client
-const isEmailConfigured = process.env.RESEND_API_KEY;
-let resend = null;
-if (isEmailConfigured) {
-  resend = new Resend(process.env.RESEND_API_KEY);
-}
+const isEmailConfigured = Boolean(process.env.RESEND_API_KEY);
 
 // Send test email
 router.post('/test', authMiddleware, superAdminMiddleware, async (req, res) => {
@@ -26,7 +21,7 @@ router.post('/test', authMiddleware, superAdminMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Subject, body, and test email address are required' });
     }
 
-    if (!isEmailConfigured || !resend) {
+    if (!isEmailConfigured) {
       return res.status(503).json({ error: 'Email service is not configured' });
     }
 
@@ -52,8 +47,10 @@ router.post('/test', authMiddleware, superAdminMiddleware, async (req, res) => {
     // Preserve line breaks from the textarea
     const htmlBody = body.replace(/\n/g, '<br>\n');
 
-    // Send test email
-    await resend.emails.send({
+    // Send test email. sendViaResend throws if Resend rejects it - the SDK
+    // resolves to { data, error } rather than throwing, so this used to report
+    // success for messages that were never delivered.
+    const sent = await sendViaResend({
       from: process.env.EMAIL_FROM,
       to: testEmail,
       subject: `[TEST] ${subject}`,
@@ -66,23 +63,33 @@ router.post('/test', authMiddleware, superAdminMiddleware, async (req, res) => {
           ${htmlBody}
           <div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #eee; color: #666; font-size: 12px;">
             <p>This is a test email sent from the Bulk Email tool.</p>
-            <p>Sent by: ${req.user.name || req.user.email}</p>
+            <p>Sent by: ${req.user.username}</p>
           </div>
         </div>
       `
     });
 
-    console.log(`📧 Test email sent to ${testEmail} by ${req.user.email}`);
+    console.log(`Test email accepted by Resend (id ${sent.id}) for ${testEmail}, sent by ${req.user.username}`);
     if (logoImgUrl) console.log(`   Logo URL used: ${logoImgUrl}`);
 
     res.json({
       success: true,
       message: `Test email sent to ${testEmail}`,
+      messageId: sent.id,
       logoUrl: logoImgUrl || null
     });
   } catch (error) {
     console.error('Error sending test email:', error);
-    res.status(500).json({ error: 'Failed to send test email' });
+    // Surface the actual reason. A generic message here is what made this
+    // impossible to diagnose from the UI.
+    res.status(502).json({
+      error: 'Failed to send test email',
+      reason: error.message,
+      resendError: error.resendError || undefined,
+      hint: error.resendError
+        ? 'Check that the EMAIL_FROM domain is verified at https://resend.com/domains and that RESEND_API_KEY has send permission.'
+        : undefined,
+    });
   }
 });
 
@@ -102,7 +109,7 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
       return res.status(400).json({ error: 'Either emails or eventIds must be provided' });
     }
 
-    if (!isEmailConfigured || !resend) {
+    if (!isEmailConfigured) {
       return res.status(503).json({ error: 'Email service is not configured' });
     }
 
@@ -213,7 +220,7 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
       try {
         const attachments = [];
 
-        await resend.emails.send({
+        await sendViaResend({
           from: process.env.EMAIL_FROM,
           to: recipient.email,
           subject: subject,
@@ -255,7 +262,7 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
       }
     }
 
-    console.log(`📧 Bulk email sent by ${req.user.email}: ${sentCount} sent, ${failedCount} failed`);
+    console.log(`Bulk email by ${req.user.username}: ${sentCount} sent, ${failedCount} failed`);
 
     res.json({
       success: true,

@@ -12,13 +12,93 @@ if (isEmailConfigured) {
   resend = new Resend(process.env.RESEND_API_KEY);
 }
 
+/**
+ * Send through Resend, and actually check the result.
+ *
+ * The Resend SDK does NOT throw on failure - it resolves to { data, error }.
+ * Every call site here used to `await` it and assume success, so a rejected
+ * send (unverified sending domain, bad API key, invalid recipient) was logged
+ * as "sent" and the ticket was marked email_sent = true. Silent, and invisible
+ * until someone noticed the mail never arrived.
+ *
+ * Anything that goes wrong now throws. Callers already wrap these in try/catch.
+ */
+class EmailNotConfiguredError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'EmailNotConfiguredError';
+  }
+}
+
+/**
+ * Turn a Resend SDK result into success or a throw.
+ *
+ * Separated out so it can be tested without a network call or a live API key -
+ * this is the logic that was missing, so it is the logic worth testing.
+ */
+function assertResendAccepted(result, to = 'unknown recipient') {
+  if (result?.error) {
+    const detail = result.error.message || JSON.stringify(result.error);
+    const error = new Error(`Resend rejected the message: ${detail}`);
+    error.name = 'ResendError';
+    error.resendError = result.error;
+    // Most common causes, in order: the EMAIL_FROM domain is not verified in
+    // Resend, or the API key is invalid or lacks send permission.
+    console.error(`Resend error sending to ${to}:`, result.error);
+    throw error;
+  }
+
+  if (!result?.data?.id) {
+    const error = new Error('Resend returned no message id - treating as a failure');
+    error.name = 'ResendError';
+    throw error;
+  }
+
+  return result.data;
+}
+
+async function sendViaResend(payload) {
+  if (!isEmailConfigured || !resend) {
+    throw new EmailNotConfiguredError('RESEND_API_KEY is not set - no email was sent');
+  }
+  return assertResendAccepted(await resend.emails.send(payload), payload.to);
+}
+
+/**
+ * EMAIL_FROM must use a domain verified in Resend. Warn loudly at startup
+ * rather than failing silently on the first real send.
+ */
+const UNVERIFIABLE_SENDER_DOMAINS = [
+  'gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com',
+  'outlook.com', 'live.com', 'aol.com', 'icloud.com', 'me.com',
+];
+
+function checkSenderDomain() {
+  const from = process.env.EMAIL_FROM || '';
+  const match = from.match(/<([^>]+)>/) || from.match(/(\S+@\S+)/);
+  const address = match ? match[1] : null;
+  if (!address) {
+    if (isEmailConfigured) console.warn('EMAIL_FROM is not set or has no address - sends will fail');
+    return;
+  }
+  const domain = address.split('@')[1]?.toLowerCase();
+  if (domain && UNVERIFIABLE_SENDER_DOMAINS.includes(domain)) {
+    console.error(
+      `EMAIL_FROM uses ${domain}, which can never be verified in Resend. ` +
+      'Every send will be rejected. Set EMAIL_FROM to an address on a domain ' +
+      'you own and have verified at https://resend.com/domains'
+    );
+  }
+}
+
+if (isEmailConfigured) checkSenderDomain();
+
 // Send ticket email with QR code(s)
 async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, tickets, shopId }) {
-  // Skip email if not configured
   if (!isEmailConfigured || !resend) {
-    console.log('⚠️  Email not configured - skipping email send');
-    console.log(`   Ticket would have been sent to: ${to}`);
-    return { success: false, message: 'Email not configured' };
+    throw new EmailNotConfiguredError(
+      `RESEND_API_KEY is not set - no ticket email was sent to ${to}`
+    );
   }
 
   console.log('📧 Resend Email Configuration:');
@@ -116,7 +196,7 @@ async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, 
       : '';
     const ticketWord = tickets.length === 1 ? 'Ticket' : 'Tickets';
 
-    return resend.emails.send({
+    return sendViaResend({
       from: process.env.EMAIL_FROM,
       to: to,
       subject: `Your ${ticketWord}${subjectEventPart} (${tickets.length} ${ticketWord})`,
@@ -221,7 +301,7 @@ async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, 
     });
   }
 
-  return resend.emails.send({
+  return sendViaResend({
     from: process.env.EMAIL_FROM,
     to: to,
     subject: `Your Ticket - ${ticketLabel}`,
@@ -288,7 +368,7 @@ async function sendAdminNotification({ subject, message, ticketDetails }) {
   }
 
   try {
-    await resend.emails.send({
+    await sendViaResend({
       from: process.env.EMAIL_FROM,
       to: process.env.ADMIN_EMAIL,
       subject: `[Admin Alert] ${subject}`,
@@ -377,4 +457,8 @@ async function sendAdminNotification({ subject, message, ticketDetails }) {
 module.exports = {
   sendTicketEmail,
   sendAdminNotification,
+  sendViaResend,
+  assertResendAccepted,
+  EmailNotConfiguredError,
+  checkSenderDomain,
 };
