@@ -11,7 +11,7 @@
 client_id = "4ec330693a1cfddcce1c0b228e4f7574"
 name = "admit"
 handle = "admit"
-application_url = "https://tickets.chicagoelectricpiano.com
+application_url = "https://tickets.chicagoelectricpiano.com"
 embedded = true
 
 [access_scopes]
@@ -36,7 +36,7 @@ use_legacy_install_flow = false
 [auth]
 # Only used by the legacy authorization code grant. Token exchange does not need
 # it at runtime, but at least one entry is required before an app can be public.
-redirect_urls = [ "https://REPLACE_WITH_APP_DOMAIN/api/shopify/auth/callback" ]
+redirect_urls = [ "https://tickets.chicagoelectricpiano.com/api/shopify/auth/callback" ]
 
 [webhooks]
 api_version = "2026-07"
