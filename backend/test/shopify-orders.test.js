@@ -22,7 +22,7 @@ function check(name, cond, detail = '') {
 }
 const q = (t, p) => db.query(t, p).then(r => r.rows);
 
-let SHOP;
+let SHOP, EVENT;
 
 async function reset() {
   await db.query('TRUNCATE ticket_scans, email_send_log, webhook_logs, tickets, events, settings, shops RESTART IDENTITY CASCADE');
@@ -30,11 +30,27 @@ async function reset() {
   await db.query(
     "INSERT INTO settings (shop_id, org_name, auto_send_emails) VALUES ($1, 'Test Org', false)", [SHOP]
   );
-  await db.query(`INSERT INTO events (shop_id, name, event_date, sku, active, archived) VALUES
-    ($1, 'Two Day Pass',  '2026-09-01', 'CDS-2DAY', true,  false),
-    ($1, 'Saturday Pass', '2026-09-01', 'CDS-SAT',  true,  false),
-    ($1, 'Archived Show', '2025-09-01', 'CDS-OLD',  true,  true),
-    ($1, 'Inactive Show', '2026-10-01', 'CDS-OFF',  false, false)`, [SHOP]);
+  // One show with THREE ticket types - the shape the old one-SKU-per-event
+  // model could not express - plus an archived and an inactive show.
+  await db.query(`INSERT INTO events (shop_id, name, event_date, active, archived) VALUES
+    ($1, 'Chicago Drum Show', '2026-09-01', true,  false),
+    ($1, 'Archived Show',     '2025-09-01', true,  true),
+    ($1, 'Inactive Show',     '2026-10-01', false, false)`, [SHOP]);
+
+  const ev = async (name) =>
+    (await q('SELECT id FROM events WHERE name = $1 AND shop_id = $2', [name, SHOP]))[0].id;
+  EVENT = await ev('Chicago Drum Show');
+
+  await db.query(`INSERT INTO event_ticket_types
+      (shop_id, event_id, name, shopify_variant_id, shopify_sku, sort_order) VALUES
+    ($1, $2, '2-Day Pass',    '900001', 'CDS-2DAY', 0),
+    ($1, $2, 'Saturday Only', '900002', 'CDS-SAT',  1),
+    ($1, $2, 'VIP',            NULL,    'CDS-VIP',  2)`, [SHOP, EVENT]);
+
+  // Archived and inactive shows are sellable-looking but must never match.
+  await db.query(`INSERT INTO event_ticket_types (shop_id, event_id, name, shopify_sku) VALUES
+    ($1, $2, 'GA', 'CDS-OLD'), ($1, $3, 'GA', 'CDS-OFF')`,
+    [SHOP, await ev('Archived Show'), await ev('Inactive Show')]);
 }
 
 const order = (id, lines, email = 'buyer@example.com') => ({
@@ -49,11 +65,18 @@ const order = (id, lines, email = 'buyer@example.com') => ({
   await reset();
   let r = await orders.processOrderCreate(
     order(1001, [
-      { id: 5001, sku: 'CDS-2DAY', quantity: 2 },
+      { id: 5001, variant_id: 900001, sku: 'CDS-2DAY', quantity: 2 },
       { id: 5002, sku: 'CDS-SAT', quantity: 1 },
     ]), { source: 'live', shopId: SHOP });
   check('outcome=created', r.outcome === 'created', r.outcome);
   check('3 tickets created', r.tickets.length === 3, `got ${r.tickets.length}`);
+  check('all 3 belong to ONE event', 
+    (await q('SELECT DISTINCT event_id FROM tickets')).length === 1);
+  const typeNames = (await q(
+    `SELECT tt.name, COUNT(*) c FROM tickets t JOIN event_ticket_types tt ON tt.id = t.ticket_type_id
+      GROUP BY tt.name ORDER BY tt.name`)).map((x) => [x.name, +x.c]);
+  check('tickets carry their ticket type',
+    JSON.stringify(typeNames) === '[["2-Day Pass",2],["Saturday Only",1]]', JSON.stringify(typeNames));
   let rows = await q('SELECT shopify_line_item_id, COUNT(*) c FROM tickets GROUP BY 1 ORDER BY 1');
   check('line item ids recorded 2+1', JSON.stringify(rows.map(x => [x.shopify_line_item_id, +x.c])) === '[["5001",2],["5002",1]]', JSON.stringify(rows));
   check('QR generated', r.tickets.every(t => t.qrCodeDataUrl?.startsWith('data:image/png')));
@@ -73,8 +96,66 @@ const order = (id, lines, email = 'buyer@example.com') => ({
   r = await orders.processOrderCreate(order(1003, [{ id: 5004, sku: 'CDS-OFF', quantity: 1 }]), { source: 'retry', shopId: SHOP });
   check('inactive event -> no tickets', r.outcome === 'no_ticket_items', r.outcome);
 
+  console.log('\nC2. matching precedence and unmatched reporting');
+  await reset();
+  // Variant id wins over SKU. Here the SKU points at a DIFFERENT type than the
+  // variant id - a real case when someone edits a SKU in Shopify.
+  r = await orders.processOrderCreate(
+    order(1200, [{ id: 6100, variant_id: 900002, sku: 'CDS-2DAY', quantity: 1 }]),
+    { source: 'live', shopId: SHOP });
+  let named = await q(`SELECT tt.name FROM tickets t JOIN event_ticket_types tt ON tt.id = t.ticket_type_id`);
+  check('variant id takes precedence over SKU',
+    named.length === 1 && named[0].name === 'Saturday Only', JSON.stringify(named));
+
+  await reset();
+  // A type with no variant id still matches by SKU.
+  r = await orders.processOrderCreate(order(1201, [{ id: 6101, sku: 'cds-vip', quantity: 1 }]),
+    { source: 'live', shopId: SHOP });
+  named = await q(`SELECT tt.name FROM tickets t JOIN event_ticket_types tt ON tt.id = t.ticket_type_id`);
+  check('SKU fallback works, case-insensitively',
+    named.length === 1 && named[0].name === 'VIP', JSON.stringify(named));
+
+  await reset();
+  r = await orders.processOrderCreate(
+    order(1202, [{ id: 6102, sku: 'TYPO-SKU', quantity: 2, title: 'Weekend Pass' }]),
+    { source: 'live', shopId: SHOP });
+  check('a mistyped SKU produces no tickets', r.outcome === 'no_ticket_items', r.outcome);
+  check('  and is RECORDED rather than silently dropped',
+    r.unmatched.length === 1 && r.unmatched[0].sku === 'TYPO-SKU', JSON.stringify(r.unmatched));
+  let log = (await q('SELECT error_message, unmatched_line_items FROM webhook_logs ORDER BY id DESC LIMIT 1'))[0];
+  check('  the webhook log names the unmatched SKU', /TYPO-SKU/.test(log.error_message || ''), log.error_message);
+  check('  and stores the line item for the needs-attention list',
+    Array.isArray(log.unmatched_line_items) && log.unmatched_line_items[0].title === 'Weekend Pass',
+    JSON.stringify(log.unmatched_line_items));
+
+  await reset();
+  r = await orders.processOrderCreate(
+    order(1203, [
+      { id: 6103, sku: 'CDS-2DAY', quantity: 1 },
+      { id: 6104, sku: 'NOT-A-TICKET', quantity: 1 },
+    ]), { source: 'live', shopId: SHOP });
+  check('a PARTIAL match still creates the matched tickets', r.tickets.length === 1, `${r.tickets.length}`);
+  check('  and still flags the unmatched one', r.unmatched.length === 1, JSON.stringify(r.unmatched));
+  log = (await q('SELECT error_message FROM webhook_logs ORDER BY id DESC LIMIT 1'))[0];
+  check('  the log says partially matched', /Partially matched/.test(log.error_message || ''), log.error_message);
+
+  await reset();
+  r = await orders.processOrderCreate(
+    order(1204, [{ id: 6105, quantity: 1, title: 'A t-shirt' }]),
+    { source: 'live', shopId: SHOP });
+  check('a line item with no sku/variant is NOT flagged as a problem',
+    r.unmatched.length === 0, JSON.stringify(r.unmatched));
+
   // ---- D: partial refund ----
   console.log('\nD. partial refund voids only the refunded ticket');
+  // Self-contained: the blocks above reset the database between cases.
+  await reset();
+  await orders.processOrderCreate(
+    order(1001, [
+      { id: 5001, variant_id: 900001, sku: 'CDS-2DAY', quantity: 2 },
+      { id: 5002, sku: 'CDS-SAT', quantity: 1 },
+    ]), { source: 'live', shopId: SHOP });
+
   r = await orders.processOrderStatusChange({
     payload: { order_id: 1001, refund_line_items: [{ line_item_id: 5001, quantity: 1 }] },
     status: 'refunded', webhookType: 'refund', source: 'live', shopId: SHOP,

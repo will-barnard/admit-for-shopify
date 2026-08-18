@@ -14,9 +14,11 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
     const ticketResult = await db.query(
       `SELECT t.id, t.name, t.email, t.is_used, t.status, t.event_id,
               e.name as event_name, e.event_date, e.location,
-              e.archived as event_archived
+              e.archived as event_archived,
+              tt.name as ticket_type_name
        FROM tickets t
-       LEFT JOIN events e ON t.event_id = e.id
+       LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+       LEFT JOIN event_ticket_types tt ON tt.id = t.ticket_type_id AND tt.shop_id = t.shop_id
        WHERE t.uuid = $1 AND t.shop_id = $2`,
       [uuid, req.shopId]
     );
@@ -78,6 +80,7 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
       message: 'Access granted',
       name: ticket.name,
       eventName: ticket.event_name,
+      ticketType: ticket.ticket_type_name || null,
       eventDate: ticket.event_date,
       location: ticket.location,
     });

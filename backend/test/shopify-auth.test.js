@@ -105,8 +105,15 @@ function sessionToken(overrides = {}) {
   await db.query('TRUNCATE ticket_scans, email_send_log, webhook_logs, tickets, events, settings, shops, users RESTART IDENTITY CASCADE');
   const shopId = (await q("INSERT INTO shops (domain) VALUES ('shop-a.myshopify.com') RETURNING id"))[0].id;
   await db.query("INSERT INTO settings (shop_id, org_name, auto_send_emails) VALUES ($1,'A',false)", [shopId]);
+  const eventId = (await q(
+    "INSERT INTO events (shop_id, name, event_date, active) VALUES ($1,'Fest','2026-09-01',true) RETURNING id",
+    [shopId]
+  ))[0].id;
+  // Order matching resolves line items through ticket types, not events.
   await db.query(
-    "INSERT INTO events (shop_id, name, event_date, sku, active) VALUES ($1,'Fest','2026-09-01','SKU-1',true)", [shopId]
+    `INSERT INTO event_ticket_types (shop_id, event_id, name, shopify_variant_id, shopify_sku)
+     VALUES ($1, $2, 'General Admission', '77001', 'SKU-1')`,
+    [shopId, eventId]
   );
   shopContextModule.clearShopCache();
 

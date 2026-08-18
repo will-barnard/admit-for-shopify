@@ -35,10 +35,17 @@ services:
     #
     # env_file has no such failure mode: a key present in .env reaches the
     # container, a key absent from .env is simply not set, and the app can tell
-    # the difference. required: false keeps local runs working without a .env.
+    # the difference.
+    #
+    # Deliberately the plain string form, not `- path: .env / required: false`.
+    # The object form needs Docker Compose 2.24+ (Jan 2024); on anything older
+    # the service fails to start while services without an env_file come up
+    # fine, which looks like the backend crashing rather than a schema problem.
+    # The string form works everywhere, but the file must EXIST - `cp
+    # .env.example .env` before `docker compose up` locally. Beachhead always
+    # writes one.
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
       # Only values that are genuinely computed here, or constant.
       NODE_ENV: production

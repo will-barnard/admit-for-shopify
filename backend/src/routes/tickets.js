@@ -14,11 +14,13 @@ const router = express.Router();
 router.get('/', authMiddleware, async (req, res) => {
   try {
     const ticketsResult = await db.query(
-      `SELECT t.id, t.event_id, t.name, t.email, t.uuid, t.is_used, t.email_sent, t.status, t.shopify_order_id, t.created_at,
+      `SELECT t.id, t.event_id, t.ticket_type_id, t.name, t.email, t.uuid, t.is_used, t.email_sent, t.status, t.shopify_order_id, t.created_at,
               e.name as event_name,
-              e.archived as event_archived
+              e.archived as event_archived,
+              tt.name as ticket_type_name
        FROM tickets t
        LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
+       LEFT JOIN event_ticket_types tt ON tt.id = t.ticket_type_id AND tt.shop_id = t.shop_id
        WHERE t.shop_id = $1
        ORDER BY t.created_at DESC`,
       [req.shopId]
@@ -89,8 +91,13 @@ router.post('/',
       const verifyUrl = `${process.env.FRONTEND_URL}/verify/${ticketUuid}`;
 
       const result = await db.query(
-        'INSERT INTO tickets (shop_id, event_id, name, email, uuid) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-        [req.shopId, eventId, name, email, ticketUuid]
+        `INSERT INTO tickets (shop_id, event_id, ticket_type_id, name, email, uuid)
+         VALUES ($1, $2,
+           COALESCE($3, (SELECT id FROM event_ticket_types
+                          WHERE event_id = $2 AND shop_id = $1 AND active = true
+                          ORDER BY sort_order, id LIMIT 1)),
+           $4, $5, $6) RETURNING *`,
+        [req.shopId, eventId, req.body.ticketTypeId || null, name, email, ticketUuid]
       );
 
       const ticket = result.rows[0];
@@ -185,8 +192,13 @@ router.post('/create-order',
           const verifyUrl = `${process.env.FRONTEND_URL}/verify/${ticketUuid}`;
 
           const result = await db.query(
-            'INSERT INTO tickets (shop_id, event_id, name, email, uuid, shopify_order_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
-            [req.shopId, eventId, name, customerEmail, ticketUuid, manualOrderId]
+            `INSERT INTO tickets (shop_id, event_id, ticket_type_id, name, email, uuid, shopify_order_id)
+             VALUES ($1, $2,
+               COALESCE($3, (SELECT id FROM event_ticket_types
+                              WHERE event_id = $2 AND shop_id = $1 AND active = true
+                              ORDER BY sort_order, id LIMIT 1)),
+               $4, $5, $6, $7) RETURNING *`,
+            [req.shopId, eventId, ticketItem.ticketTypeId || null, name, customerEmail, ticketUuid, manualOrderId]
           );
           const ticket = result.rows[0];
           const qrCodeDataUrl = await QRCode.toDataURL(verifyUrl);

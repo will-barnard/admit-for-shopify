@@ -375,6 +375,108 @@ async function runMigrations() {
     await db.query(`CREATE INDEX IF NOT EXISTS idx_tickets_shop_created ON tickets(shop_id, created_at DESC)`);
     await db.query(`CREATE INDEX IF NOT EXISTS idx_events_shop_active ON events(shop_id, active, archived)`);
 
+    // ---------------------------------------------------------------
+    // Ticket types
+    //
+    // An event has ONE OR MORE ticket types. A simple event has exactly one -
+    // which is what every pre-existing event is migrated to below, so nothing
+    // about a single-type event changes.
+    //
+    // Each ticket type maps to a Shopify product variant. Matching prefers
+    // shopify_variant_id: a variant id is immutable, whereas a SKU is free text
+    // a merchant can edit in the Shopify product admin at any time, silently
+    // breaking the mapping. SKU is kept as a fallback for orders placed before
+    // a variant id was recorded.
+    // ---------------------------------------------------------------
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS event_ticket_types (
+        id SERIAL PRIMARY KEY,
+        shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+        event_id INTEGER NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+        name VARCHAR(255) NOT NULL,
+        shopify_variant_id VARCHAR(255),
+        shopify_product_id VARCHAR(255),
+        shopify_sku VARCHAR(255),
+        capacity INTEGER,
+        sort_order INTEGER DEFAULT 0,
+        active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    console.log('\u2713 Ticket types table created');
+
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_ticket_types_shop ON event_ticket_types(shop_id)`);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_ticket_types_event ON event_ticket_types(event_id)`);
+    // Partial unique indexes: a variant or SKU may only be claimed once per
+    // shop, but many ticket types legitimately have neither set yet.
+    await db.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_types_variant
+        ON event_ticket_types(shop_id, shopify_variant_id)
+        WHERE shopify_variant_id IS NOT NULL
+    `);
+    await db.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_ticket_types_sku
+        ON event_ticket_types(shop_id, lower(shopify_sku))
+        WHERE shopify_sku IS NOT NULL
+    `);
+
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'tickets' AND column_name = 'ticket_type_id'
+        ) THEN
+          ALTER TABLE tickets
+            ADD COLUMN ticket_type_id INTEGER REFERENCES event_ticket_types(id) ON DELETE SET NULL;
+        END IF;
+      END $$;
+    `);
+    await db.query(`CREATE INDEX IF NOT EXISTS idx_tickets_ticket_type ON tickets(ticket_type_id)`);
+    console.log('\u2713 tickets.ticket_type_id ensured');
+
+    // Backfill: one ticket type per existing event, carrying that event's SKU.
+    // Named "General Admission" rather than reusing the event name, which would
+    // read as "Chicago Drum Show / Chicago Drum Show" in the UI. Rename freely.
+    await db.query(`
+      INSERT INTO event_ticket_types (shop_id, event_id, name, shopify_sku, sort_order)
+      SELECT e.shop_id, e.id, 'General Admission', e.sku, 0
+        FROM events e
+       WHERE NOT EXISTS (
+         SELECT 1 FROM event_ticket_types tt WHERE tt.event_id = e.id
+       )
+    `);
+
+    // Point existing tickets at their event's ticket type. Events migrated
+    // above have exactly one, so this is unambiguous.
+    await db.query(`
+      UPDATE tickets t
+         SET ticket_type_id = tt.id
+        FROM event_ticket_types tt
+       WHERE t.ticket_type_id IS NULL
+         AND tt.event_id = t.event_id
+         AND tt.shop_id = t.shop_id
+    `);
+    console.log('\u2713 Existing events backfilled with a single ticket type');
+
+    // Record which line items an order contained that matched no ticket type,
+    // so a mistyped or unmapped SKU is visible instead of silently producing
+    // nothing. See routes/webhooks.js and the "needs attention" list.
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'webhook_logs' AND column_name = 'unmatched_line_items'
+        ) THEN
+          ALTER TABLE webhook_logs ADD COLUMN unmatched_line_items JSONB;
+        END IF;
+      END $$;
+    `);
+    console.log('\u2713 webhook_logs.unmatched_line_items ensured');
+
     console.log('Migrations completed successfully!');
     process.exit(0);
   } catch (error) {

@@ -53,24 +53,65 @@ async function autoSendEmailsEnabled(shopId) {
 }
 
 /**
- * SKU -> event, for events that can actually accept new tickets.
+ * Ticket types that can currently be sold, indexed for line item matching.
  *
- * Deliberately excludes archived events: routes/verify.js rejects scans on
- * archived events, so issuing tickets against one produces a ticket that can
- * never be used.
+ * An event has one or more ticket types; a simple event has exactly one. Only
+ * types belonging to an active, non-archived event are sellable - routes/verify.js
+ * rejects scans on archived events, so issuing a ticket against one produces a
+ * ticket that can never be used.
+ *
+ * Two indexes are returned because a line item is matched by variant id FIRST
+ * and SKU only as a fallback. A Shopify variant id is immutable; a SKU is free
+ * text a merchant can edit in the product admin at any time, which silently
+ * breaks the mapping and makes orders stop producing tickets.
  */
-async function loadSellableEventsBySku(shopId) {
+async function loadSellableTicketTypes(shopId) {
   const result = await db.query(
-    `SELECT id, name, sku FROM events
-      WHERE shop_id = $1
-        AND active = true
-        AND sku IS NOT NULL
-        AND (archived IS NULL OR archived = false)`,
+    `SELECT tt.id, tt.name, tt.shopify_variant_id, tt.shopify_sku, tt.capacity,
+            e.id AS event_id, e.name AS event_name
+       FROM event_ticket_types tt
+       JOIN events e ON e.id = tt.event_id AND e.shop_id = tt.shop_id
+      WHERE tt.shop_id = $1
+        AND tt.active = true
+        AND e.active = true
+        AND (e.archived IS NULL OR e.archived = false)
+      ORDER BY tt.sort_order, tt.id`,
     [shopId]
   );
+
+  const byVariant = new Map();
   const bySku = new Map();
-  result.rows.forEach((event) => bySku.set(event.sku.toLowerCase(), event));
-  return bySku;
+  for (const row of result.rows) {
+    if (row.shopify_variant_id) byVariant.set(String(row.shopify_variant_id), row);
+    if (row.shopify_sku) bySku.set(row.shopify_sku.toLowerCase(), row);
+  }
+  return { byVariant, bySku, count: result.rows.length };
+}
+
+/** Resolve one Shopify line item to a ticket type, or null. */
+function matchLineItem(lineItem, { byVariant, bySku }) {
+  const variantId = lineItem.variant_id ?? lineItem.variantId;
+  if (variantId !== undefined && variantId !== null) {
+    const hit = byVariant.get(String(variantId));
+    if (hit) return { ticketType: hit, matchedOn: 'variant_id' };
+  }
+  const sku = lineItem.sku?.toLowerCase();
+  if (sku) {
+    const hit = bySku.get(sku);
+    if (hit) return { ticketType: hit, matchedOn: 'sku' };
+  }
+  return null;
+}
+
+/** A compact record of what didn't match, for the needs-attention list. */
+function describeUnmatched(lineItem) {
+  return {
+    sku: lineItem.sku ?? null,
+    variant_id: lineItem.variant_id != null ? String(lineItem.variant_id) : null,
+    product_id: lineItem.product_id != null ? String(lineItem.product_id) : null,
+    title: lineItem.title || lineItem.name || null,
+    quantity: lineItem.quantity ?? 1,
+  };
 }
 
 async function withQrCode(ticket, eventName) {
@@ -103,14 +144,16 @@ async function logWebhook({ shopId, orderId, payload, type, errorMessage = null,
   }
 }
 
-async function markWebhookProcessed(webhookLogId, { shopId, ticketsCreated = 0, errorMessage = null } = {}) {
+async function markWebhookProcessed(webhookLogId, { shopId, ticketsCreated = 0, errorMessage = null, unmatched = null } = {}) {
   if (!webhookLogId) return;
   try {
     await db.query(
       `UPDATE webhook_logs
-          SET processed = TRUE, processed_at = NOW(), tickets_created = $1, error_message = $2
+          SET processed = TRUE, processed_at = NOW(), tickets_created = $1, error_message = $2,
+              unmatched_line_items = $5
         WHERE id = $3 AND shop_id = $4`,
-      [ticketsCreated, errorMessage, webhookLogId, shopId]
+      [ticketsCreated, errorMessage, webhookLogId, shopId,
+       unmatched && unmatched.length > 0 ? JSON.stringify(unmatched) : null]
     );
   } catch (error) {
     console.error('Failed to update webhook log:', error);
@@ -183,33 +226,44 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
         }
       }
 
-      const eventsBySku = await loadSellableEventsBySku(shopId);
-      const ticketLineItems = lineItems.filter((item) => {
-        const sku = item.sku?.toLowerCase();
-        return sku && eventsBySku.has(sku);
-      });
+      const index = await loadSellableTicketTypes(shopId);
 
-      if (ticketLineItems.length === 0) {
-        return { duplicate: false, tickets: [] };
+      const matched = [];
+      const unmatched = [];
+      for (const lineItem of lineItems) {
+        const hit = matchLineItem(lineItem, index);
+        if (hit) matched.push({ lineItem, ...hit });
+        // Only record a line item as "unmatched" if it looks like it was meant
+        // to be a ticket. Orders routinely contain non-ticket products, and
+        // listing those as problems would make the needs-attention list useless.
+        else if (lineItem.sku || lineItem.variant_id) unmatched.push(describeUnmatched(lineItem));
+      }
+
+      if (matched.length === 0) {
+        return { duplicate: false, tickets: [], unmatched };
       }
 
       const rows = [];
-      for (const lineItem of ticketLineItems) {
-        const event = eventsBySku.get(lineItem.sku.toLowerCase());
+      for (const { lineItem, ticketType, matchedOn } of matched) {
         const quantity = lineItem.quantity || 1;
         const lineItemId = asId(lineItem.id);
 
         for (let i = 0; i < quantity; i += 1) {
           const inserted = await client.query(
-            `INSERT INTO tickets (shop_id, event_id, name, email, uuid, shopify_order_id, shopify_line_item_id, email_sent, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, false, NOW())
+            `INSERT INTO tickets (shop_id, event_id, ticket_type_id, name, email, uuid, shopify_order_id, shopify_line_item_id, email_sent, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, NOW())
              RETURNING *`,
-            [shopId, event.id, customerName, customerEmail, uuidv4(), orderId, lineItemId]
+            [shopId, ticketType.event_id, ticketType.id, customerName, customerEmail, uuidv4(), orderId, lineItemId]
           );
-          rows.push({ ticket: inserted.rows[0], eventName: event.name });
+          rows.push({
+            ticket: inserted.rows[0],
+            eventName: ticketType.event_name,
+            ticketTypeName: ticketType.name,
+            matchedOn,
+          });
         }
       }
-      return { duplicate: false, tickets: rows };
+      return { duplicate: false, tickets: rows, unmatched };
     });
   } catch (error) {
     console.error('Error creating tickets for order:', error);
@@ -227,16 +281,27 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
     return { outcome: 'duplicate', tickets: created.tickets, webhookLogId: logId };
   }
 
+  const unmatched = created.unmatched || [];
+
   if (created.tickets.length === 0) {
-    await markWebhookProcessed(logId, { shopId, errorMessage: 'No ticket items found in order' });
-    return { outcome: 'no_ticket_items', tickets: [], webhookLogId: logId };
+    // This used to be indistinguishable from success. If the order contained
+    // things that look like tickets but matched nothing, say so and record
+    // them - a mistyped or unmapped SKU is otherwise completely invisible.
+    const detail = unmatched.length > 0
+      ? `No ticket types matched. Unmatched: ${unmatched.map((u) => u.sku || u.variant_id).join(', ')}`
+      : 'No ticket items found in order';
+    if (unmatched.length > 0) {
+      console.warn(`Order ${orderId} matched no ticket types. Unmatched:`, unmatched);
+    }
+    await markWebhookProcessed(logId, { shopId, errorMessage: detail, unmatched });
+    return { outcome: 'no_ticket_items', tickets: [], unmatched, webhookLogId: logId };
   }
 
   // QR generation and email happen outside the transaction - they are slow and
   // must not hold a database connection or a lock.
   const tickets = [];
-  for (const { ticket, eventName } of created.tickets) {
-    tickets.push(await withQrCode(ticket, eventName));
+  for (const { ticket, eventName, ticketTypeName } of created.tickets) {
+    tickets.push({ ...(await withQrCode(ticket, eventName)), ticket_type_name: ticketTypeName });
   }
 
   const email = await maybeSendOrderEmail({
@@ -248,10 +313,19 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
     sendType: source === 'retry' ? 'shopify_order_retry' : 'shopify_order',
   });
 
-  await markWebhookProcessed(logId, { shopId, ticketsCreated: tickets.length });
+  await markWebhookProcessed(logId, {
+    shopId,
+    ticketsCreated: tickets.length,
+    unmatched,
+    // A partial match still deserves attention: some line items produced
+    // tickets and others silently did not.
+    errorMessage: unmatched.length > 0
+      ? `Partially matched. Unmatched: ${unmatched.map((u) => u.sku || u.variant_id).join(', ')}`
+      : null,
+  });
   console.log(`Created ${tickets.length} ticket(s) from order ${orderId}`);
 
-  return { outcome: 'created', tickets, email, webhookLogId: logId };
+  return { outcome: 'created', tickets, email, unmatched, webhookLogId: logId };
 }
 
 /**
@@ -468,6 +542,8 @@ module.exports = {
   DAILY_EMAIL_LIMIT,
   processOrderCreate,
   processOrderStatusChange,
+  loadSellableTicketTypes,
+  matchLineItem,
   logWebhook,
   markWebhookProcessed,
   markWebhookFailed,
