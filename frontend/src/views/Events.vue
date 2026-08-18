@@ -147,6 +147,7 @@
             <p class="hint">
               Each type maps to one Shopify variant. Orders match on variant ID first, then SKU.
               One type is all a simple event needs.
+              <template v-if="embedded"> Use <em>Pick in Shopify</em> rather than typing an ID.</template>
             </p>
 
             <div v-for="(t, i) in types" :key="t.key" class="type-row">
@@ -159,6 +160,16 @@
                   placeholder="Ticket type name, e.g. General Admission"
                 />
                 <button
+                  v-if="embedded"
+                  type="button"
+                  class="btn-pick"
+                  :disabled="picking === t.key"
+                  title="Choose the Shopify variant this ticket type sells as"
+                  @click="pickFor(t)"
+                >
+                  {{ picking === t.key ? 'Opening…' : 'Pick in Shopify' }}
+                </button>
+                <button
                   type="button"
                   class="btn-remove"
                   :disabled="types.length <= 1 || (t.ticket_count || 0) > 0"
@@ -168,6 +179,7 @@
                   Remove
                 </button>
               </div>
+              <p v-if="t.picked_label" class="picked-label">Linked to {{ t.picked_label }}</p>
               <div class="type-row-fields">
                 <label class="mini">
                   Shopify variant ID
@@ -221,6 +233,7 @@ import { useAuthStore } from '@/stores/auth';
 import axios from 'axios';
 import ChangePasswordModal from '@/components/ChangePasswordModal.vue';
 import PageHeader from '@/components/PageHeader.vue';
+import { isEmbedded, pickVariant } from '@/shopify';
 
 let rowKey = 0;
 
@@ -256,15 +269,22 @@ export default {
     const types = ref([]);
     const originalTypeIds = ref([]);
 
+    // The Shopify variant picker only exists inside the Shopify admin. When the
+    // app is opened directly, the variant ID and SKU fields stay hand-typed.
+    const embedded = ref(isEmbedded());
+    const picking = ref(null);
+
     const blankType = (name = '') => ({
       key: ++rowKey,
       id: null,
       name,
       shopify_variant_id: '',
+      shopify_product_id: '',
       shopify_sku: '',
       capacity: '',
       active: true,
-      ticket_count: 0
+      ticket_count: 0,
+      picked_label: ''
     });
 
     const isMapped = (t) => Boolean(t.shopify_variant_id || t.shopify_sku);
@@ -337,15 +357,39 @@ export default {
         id: tt.id || null,
         name: tt.name || '',
         shopify_variant_id: tt.shopify_variant_id || '',
+        shopify_product_id: tt.shopify_product_id || '',
         shopify_sku: tt.shopify_sku || '',
         capacity: tt.capacity ?? '',
         active: tt.active !== false,
-        ticket_count: Number(tt.ticket_count || 0)
+        ticket_count: Number(tt.ticket_count || 0),
+        picked_label: ''
       }));
       originalTypeIds.value = types.value.filter((t) => t.id).map((t) => t.id);
     };
 
     const addType = () => { types.value.push(blankType('')); };
+
+    // Fill a row from Shopify's own catalogue. The SKU is stored too, as a
+    // fallback for orders placed before the variant id was known - and because
+    // it is what a human recognises in the unmatched list.
+    const pickFor = async (t) => {
+      picking.value = t.key;
+      modalError.value = '';
+      try {
+        const picked = await pickVariant();
+        if (!picked) return; // cancelled
+        t.shopify_variant_id = picked.variantId || '';
+        t.shopify_sku = picked.sku || '';
+        t.shopify_product_id = picked.productId || '';
+        t.picked_label = picked.title || picked.productTitle || `variant ${picked.variantId}`;
+        if (!t.name) t.name = picked.title || picked.productTitle || '';
+      } catch (err) {
+        modalError.value = err.message
+          || 'Could not open the Shopify picker. If this app was just granted the products permission, reinstall it from the Shopify admin.';
+      } finally {
+        picking.value = null;
+      }
+    };
 
     const removeType = (i) => {
       const t = types.value[i];
@@ -364,6 +408,7 @@ export default {
       id: t.id || undefined,
       name: (t.name || '').trim(),
       shopify_variant_id: (t.shopify_variant_id || '').trim() || null,
+      shopify_product_id: (t.shopify_product_id || '').trim() || null,
       shopify_sku: (t.shopify_sku || '').trim() || null,
       capacity: t.capacity === '' || t.capacity === null ? null : Number(t.capacity),
       sort_order: i,
@@ -474,6 +519,7 @@ export default {
       authStore, events, loading, error, isChangePasswordOpen, showModal,
       editingEvent, saving, modalError, form, showArchived,
       types, addType, removeType, isMapped, mappingLabel, removeTitle,
+      embedded, picking, pickFor,
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
       archiveEvent, unarchiveEvent, loadEvents,
       formatDate, showChangePassword, handleLogout
@@ -578,6 +624,10 @@ export default {
 .type-row-foot { display: flex; align-items: center; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
 .issued-note { font-size: 12px; color: #666; }
 .unmapped-note { font-size: 12px; color: #8a5a00; }
+.btn-pick { padding: 6px 12px; border: 1px solid #667eea; color: #667eea; background: white; border-radius: 6px; cursor: pointer; font-size: 12px; white-space: nowrap; }
+.btn-pick:hover { background: #f0f2ff; }
+.btn-pick:disabled { opacity: 0.5; cursor: not-allowed; }
+.picked-label { margin: 0 0 8px; font-size: 12px; color: #3f4a8a; }
 .btn-remove { padding: 6px 12px; border: 1px solid #fcc; color: #c33; background: white; border-radius: 6px; cursor: pointer; font-size: 12px; }
 .btn-remove:disabled { opacity: 0.35; cursor: not-allowed; }
 

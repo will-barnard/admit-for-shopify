@@ -64,6 +64,49 @@ export async function getSessionToken() {
 }
 
 /**
+ * Shopify ids arrive as GIDs ("gid://shopify/ProductVariant/45123456789012") but
+ * order webhooks carry the bare numeric id, which is what gets stored and
+ * matched on. Take the last path segment.
+ */
+export function numericId(gid) {
+  if (gid == null) return null;
+  const str = String(gid);
+  const tail = str.split('/').pop();
+  return /^\d+$/.test(tail) ? tail : null;
+}
+
+/**
+ * Open Shopify's native variant picker.
+ *
+ * Requires the read_products scope AND that the scope has actually been pushed
+ * with `shopify app deploy` - a merchant on an older grant sees the picker
+ * throw. That is why the failure is reported rather than swallowed: silently
+ * doing nothing when a button is clicked is worse than saying why.
+ *
+ * @returns {Promise<{variantId, productId, sku, title, productTitle}|null>}
+ *          null when the merchant cancels.
+ * @throws  when the picker is unavailable (not embedded, or scope not granted)
+ */
+export async function pickVariant() {
+  if (!isEmbedded() || typeof window.shopify?.resourcePicker !== 'function') {
+    throw new Error('The Shopify variant picker is only available when this app is open inside the Shopify admin.');
+  }
+
+  const selection = await window.shopify.resourcePicker({ type: 'variant', multiple: false, action: 'select' });
+  // Cancelling resolves with undefined (or an empty array, defensively).
+  if (!selection || selection.length === 0) return null;
+
+  const variant = Array.isArray(selection) ? selection[0] : selection;
+  return {
+    variantId: numericId(variant.id),
+    productId: numericId(variant.product?.id ?? variant.productId),
+    sku: variant.sku || null,
+    title: variant.displayName || variant.title || null,
+    productTitle: variant.product?.title || null,
+  };
+}
+
+/**
  * Attach the session token to outgoing requests.
  *
  * App Bridge patches window.fetch to do this automatically, but axios uses

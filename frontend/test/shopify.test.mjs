@@ -19,12 +19,19 @@ const check = (name, cond, detail = '') => {
 // --- stub the browser before importing anything ---
 let issuedTokens = 0;
 let idTokenImpl = async () => { issuedTokens += 1; return `token-${issuedTokens}`; };
+let pickerImpl = async () => undefined;
 
 const stubWindow = (withShopify, framed = true) => {
   const w = {
     location: { href: 'https://tickets.example.com/', origin: 'https://tickets.example.com' },
     ...(withShopify
-      ? { shopify: { config: { shop: 'test-shop.myshopify.com' }, idToken: (...a) => idTokenImpl(...a) } }
+      ? {
+          shopify: {
+            config: { shop: 'test-shop.myshopify.com' },
+            idToken: (...a) => idTokenImpl(...a),
+            resourcePicker: (...a) => pickerImpl(...a),
+          },
+        }
       : {}),
   };
   w.self = w;
@@ -35,7 +42,7 @@ stubWindow(true);
 globalThis.document = { documentElement: { classList: { add() {} } } };
 
 const axios = (await import('axios')).default;
-const { isEmbedded, shopDomain, getSessionToken, installAxiosInterceptors } =
+const { isEmbedded, shopDomain, getSessionToken, installAxiosInterceptors, numericId, pickVariant } =
   await import('../src/shopify.js');
 
 console.log('\n1. embedded detection');
@@ -82,11 +89,48 @@ check('uses a different token on the next request',
   cfg2.headers.Authorization !== cfg.headers.Authorization,
   `${cfg.headers.Authorization} vs ${cfg2.headers.Authorization}`);
 
-console.log('\n4. standalone mode is untouched');
+console.log('\n4. variant picker');
+check('numericId strips the GID prefix',
+  numericId('gid://shopify/ProductVariant/45123456789012') === '45123456789012',
+  String(numericId('gid://shopify/ProductVariant/45123456789012')));
+check('numericId rejects a non-numeric tail', numericId('gid://shopify/Product/handle-x') === null);
+check('numericId tolerates null', numericId(null) === null);
+check('numericId passes through a bare id', numericId(45123456789012) === '45123456789012');
+
+pickerImpl = async () => ([{
+  id: 'gid://shopify/ProductVariant/45123456789012',
+  sku: 'CDS-VIP',
+  displayName: 'Chicago Drum Show - VIP',
+  product: { id: 'gid://shopify/Product/8899', title: 'Chicago Drum Show' },
+}]);
+const picked = await pickVariant();
+check('returns the numeric variant id', picked.variantId === '45123456789012', String(picked.variantId));
+check('returns the numeric product id', picked.productId === '8899', String(picked.productId));
+check('returns the sku', picked.sku === 'CDS-VIP', String(picked.sku));
+check('returns a human label', picked.title === 'Chicago Drum Show - VIP', String(picked.title));
+
+pickerImpl = async () => undefined;
+check('cancelling returns null (not a throw, not a half-filled row)',
+  (await pickVariant()) === null);
+
+pickerImpl = async () => ([]);
+check('an empty selection also returns null', (await pickVariant()) === null);
+
+pickerImpl = async () => { throw new Error('Access denied for products'); };
+let threw = null;
+try { await pickVariant(); } catch (e) { threw = e; }
+check('a scope failure propagates so the UI can explain it', threw !== null, String(threw));
+pickerImpl = async () => undefined;
+
+console.log('\n5. standalone mode is untouched');
 stubWindow(false, false); // standalone: no App Bridge, top-level
 check('isEmbedded false without window.shopify', isEmbedded() === false);
 check('shopDomain null', shopDomain() === null);
 check('getSessionToken null', (await getSessionToken()) === null);
+
+let refused = null;
+try { await pickVariant(); } catch (e) { refused = e; }
+check('pickVariant refuses outside the Shopify admin', refused !== null, String(refused));
 
 const cfg3 = await handlers[handlers.length - 1].fulfilled({ url: '/api/tickets', headers: {} });
 check('interceptor adds no header when not embedded',

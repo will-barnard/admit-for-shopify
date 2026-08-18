@@ -24,10 +24,14 @@ embedded = true
 #   read_all_orders  - separately gated by Shopify, and only buys orders older
 #                      than 60 days, which webhook-driven capture never needs.
 #
-# Add later, only alongside the feature that needs them:
-#   read_products    - to pick a product/variant in the admin instead of typing a SKU
+# read_products backs the variant picker on the event form. A ticket type is
+# mapped to a Shopify variant; without this scope the merchant has to copy a
+# variant id out of the Shopify admin by hand, and a typo fails silently.
+# Read-only, and the app never writes to the catalogue.
+#
+# Add later, only alongside the feature that needs it:
 #   write_app_proxy  - to serve a ticket page under the merchant's own domain
-scopes = "read_orders"
+scopes = "read_orders,read_products"
 
 # false enables Shopify managed installation: Shopify performs the install and
 # any scope updates on `shopify app deploy`, with no OAuth redirect to implement.
