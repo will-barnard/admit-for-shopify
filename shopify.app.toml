@@ -8,10 +8,10 @@
 # client_id comes from the Dev Dashboard (dev.shopify.com/dashboard) once the
 # app record exists. `shopify app config link` will fill it in.
 
-client_id = "REPLACE_WITH_CLIENT_ID_FROM_DEV_DASHBOARD"
+client_id = "4ec330693a1cfddcce1c0b228e4f7574"
 name = "admit"
 handle = "admit"
-application_url = "https://REPLACE_WITH_APP_DOMAIN"
+application_url = "https://tickets.chicagoelectricpiano.com
 embedded = true
 
 [access_scopes]
