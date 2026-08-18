@@ -24,25 +24,27 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Pass .env straight through instead of re-declaring each key as
+    # `KEY: ${KEY}`.
+    #
+    # With the enumerated form, a key missing from .env does NOT fall back to
+    # anything - `${KEY}` interpolates to an empty string and the container
+    # receives KEY="". That is indistinguishable from "deliberately blank", and
+    # it silently clobbers the value even when something else would have
+    # supplied it. EMAIL_FROM arrived empty in production exactly this way.
+    #
+    # env_file has no such failure mode: a key present in .env reaches the
+    # container, a key absent from .env is simply not set, and the app can tell
+    # the difference. required: false keeps local runs working without a .env.
+    env_file:
+      - path: .env
+        required: false
     environment:
+      # Only values that are genuinely computed here, or constant.
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@db:5432/convention_tickets
-      JWT_SECRET: ${JWT_SECRET}
       JWT_EXPIRES_IN: 2y
-      RESEND_API_KEY: ${RESEND_API_KEY}
-      EMAIL_FROM: ${EMAIL_FROM}
-      ADMIN_EMAIL: ${ADMIN_EMAIL}
-      SHOPIFY_API_KEY: ${SHOPIFY_API_KEY}
-      FRONTEND_URL: ${FRONTEND_URL}
-      # Shopify app (custom distribution). If CLIENT_ID/SECRET are empty the
-      # Shopify integration stays dormant and the legacy Flow endpoints still work.
-      SHOPIFY_APP_CLIENT_ID: ${SHOPIFY_APP_CLIENT_ID}
-      SHOPIFY_APP_CLIENT_SECRET: ${SHOPIFY_APP_CLIENT_SECRET}
-      SHOPIFY_APP_URL: ${SHOPIFY_APP_URL}
-      SHOPIFY_API_VERSION: ${SHOPIFY_API_VERSION}
-      SHOPIFY_SCOPES: ${SHOPIFY_SCOPES}
-      DEFAULT_SHOP_DOMAIN: ${DEFAULT_SHOP_DOMAIN}
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@db:5432/convention_tickets
     expose:
       - "3000"
     depends_on:

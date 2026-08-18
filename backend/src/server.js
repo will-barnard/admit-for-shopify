@@ -2,13 +2,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 
-// Debug: Log all email-related environment variables on startup
-console.log('🔍 Environment Variables Check:');
-console.log('   RESEND_API_KEY:', process.env.RESEND_API_KEY ? `${process.env.RESEND_API_KEY.substring(0, 8)}**** (length: ${process.env.RESEND_API_KEY.length})` : 'NOT SET');
-console.log('   EMAIL_FROM:', process.env.EMAIL_FROM || 'NOT SET');
-console.log('   ADMIN_EMAIL:', process.env.ADMIN_EMAIL || 'NOT SET');
-console.log('   FRONTEND_URL:', process.env.FRONTEND_URL || 'NOT SET');
-console.log('');
+const { reportEnvironment } = require('./config/env-check');
+reportEnvironment();
+
 const authRoutes = require('./routes/auth');
 const verifierAuthRoutes = require('./routes/verifier-auth');
 const ticketRoutes = require('./routes/tickets');
