@@ -11,12 +11,34 @@
 import axios from 'axios';
 
 /**
- * App Bridge is loaded by a script tag in index.html and exposes `shopify` on
- * window. Its presence is the signal that we are embedded - checking for an
- * iframe is not enough, since the app could be framed by something else.
+ * Are we actually running inside the Shopify admin?
+ *
+ * Requires BOTH conditions, and that matters:
+ *
+ *   - framed: the Shopify admin renders the app in an iframe. Opened directly
+ *     in a tab we are top-level.
+ *   - window.shopify: App Bridge has loaded.
+ *
+ * Checking only for window.shopify was a bug. The App Bridge script is served
+ * whenever a client id is configured, so if it defines its global on a
+ * top-level page too, the app would decide it was embedded, skip the login page
+ * entirely, and then fail every request because there is no real Shopify
+ * session - locking you out with no way back to the login form.
+ *
+ * Reading window.top cross-origin throws, and that throw only happens when we
+ * ARE framed by another origin, so treat it as framed.
  */
 export function isEmbedded() {
-  return typeof window !== 'undefined' && typeof window.shopify !== 'undefined';
+  if (typeof window === 'undefined') return false;
+
+  let framed;
+  try {
+    framed = window.top !== window.self;
+  } catch {
+    framed = true;
+  }
+
+  return framed && typeof window.shopify !== 'undefined';
 }
 
 export function shopDomain() {

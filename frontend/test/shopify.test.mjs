@@ -20,13 +20,16 @@ const check = (name, cond, detail = '') => {
 let issuedTokens = 0;
 let idTokenImpl = async () => { issuedTokens += 1; return `token-${issuedTokens}`; };
 
-const stubWindow = (withShopify) => {
-  globalThis.window = {
+const stubWindow = (withShopify, framed = true) => {
+  const w = {
     location: { href: 'https://tickets.example.com/', origin: 'https://tickets.example.com' },
     ...(withShopify
       ? { shopify: { config: { shop: 'test-shop.myshopify.com' }, idToken: (...a) => idTokenImpl(...a) } }
       : {}),
   };
+  w.self = w;
+  w.top = framed ? { __other: true } : w;
+  globalThis.window = w;
 };
 stubWindow(true);
 globalThis.document = { documentElement: { classList: { add() {} } } };
@@ -36,7 +39,18 @@ const { isEmbedded, shopDomain, getSessionToken, installAxiosInterceptors } =
   await import('../src/shopify.js');
 
 console.log('\n1. embedded detection');
-check('detects embedded when window.shopify exists', isEmbedded() === true);
+check('embedded: framed AND App Bridge present', isEmbedded() === true);
+
+// The lockout case: App Bridge loaded, but we are top-level. If this reported
+// embedded, the router would skip the login page and every request would fail
+// with no way back to the login form.
+stubWindow(true, false);
+check('NOT embedded when App Bridge is present but we are top-level', isEmbedded() === false);
+
+stubWindow(false, true);
+check('NOT embedded when framed but App Bridge is absent', isEmbedded() === false);
+
+stubWindow(true, true);
 check('reads the shop domain', shopDomain() === 'test-shop.myshopify.com', shopDomain());
 
 console.log('\n2. session tokens');
@@ -69,7 +83,7 @@ check('uses a different token on the next request',
   `${cfg.headers.Authorization} vs ${cfg2.headers.Authorization}`);
 
 console.log('\n4. standalone mode is untouched');
-stubWindow(false); // no App Bridge
+stubWindow(false, false); // standalone: no App Bridge, top-level
 check('isEmbedded false without window.shopify', isEmbedded() === false);
 check('shopDomain null', shopDomain() === null);
 check('getSessionToken null', (await getSessionToken()) === null);
