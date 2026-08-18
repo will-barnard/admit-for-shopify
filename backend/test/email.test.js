@@ -11,7 +11,7 @@
  * Run: npm run test:email
  */
 
-const { assertResendAccepted, checkSenderDomain } = require('../src/services/email');
+const { assertResendAccepted, checkSenderDomain, parseSender } = require('../src/services/email');
 
 let pass = 0, fail = 0;
 const check = (name, cond, detail = '') => {
@@ -51,7 +51,38 @@ check('data without an id throws', throws(() => assertResendAccepted({ data: {} 
 check('undefined result throws', throws(() => assertResendAccepted(undefined, 'a@b.test')) !== null);
 check('null result throws', throws(() => assertResendAccepted(null, 'a@b.test')) !== null);
 
-console.log('\n4. sender domain warning');
+console.log('\n4. EMAIL_FROM parsing');
+const CANONICAL = 'Chicago Electric Piano <no-reply@chicagoelectricpiano.com>';
+const BARE = 'no-reply@chicagoelectricpiano.com';
+
+// [input, expected ok, expected domain, expected normalised value]
+const cases = [
+  [CANONICAL,                             true,  'chicagoelectricpiano.com', CANONICAL],
+  [BARE,                                  true,  'chicagoelectricpiano.com', BARE],
+  // A value pasted into a dashboard field very often carries trailing
+  // whitespace. Resend answers a malformed `from` with 422 "The domain is
+  // invalid", which reads like a verification failure but is not one.
+  [CANONICAL + ' ',                       true,  'chicagoelectricpiano.com', CANONICAL],
+  ['  ' + BARE + '\n',                    true,  'chicagoelectricpiano.com', BARE],
+  ['Chicago Electric Piano < ' + BARE + ' >', true, 'chicagoelectricpiano.com', CANONICAL],
+  ['Chicago Electric Piano',              false, null, null],
+  ['no-reply@localhost',                  false, null, null],
+  ['<>',                                  false, null, null],
+  ['',                                    false, null, null],
+  [undefined,                             false, null, null],
+];
+
+for (const [input, expectOk, expectDomain, expectValue] of cases) {
+  const r = parseSender(input);
+  const label = JSON.stringify(input);
+  check(`${expectOk ? 'accepts' : 'rejects'} ${label}`, r.ok === expectOk, JSON.stringify(r));
+  if (expectOk && r.ok) {
+    check(`  domain is ${expectDomain}`, r.domain === expectDomain, r.domain);
+    check('  normalises to the canonical form', r.value === expectValue, `[${r.value}]`);
+  }
+}
+
+console.log('\n5. sender domain warning');
 const warnings = [];
 console.error = (...a) => warnings.push(a.join(' '));
 

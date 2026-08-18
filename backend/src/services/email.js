@@ -65,35 +65,88 @@ async function sendViaResend(payload) {
 }
 
 /**
- * EMAIL_FROM must use a domain verified in Resend. Warn loudly at startup
- * rather than failing silently on the first real send.
+ * Parse and validate EMAIL_FROM.
+ *
+ * Accepts either `user@domain.tld` or `Display Name <user@domain.tld>`.
+ *
+ * Everything is trimmed. A value pasted into a dashboard field very often
+ * carries a trailing space or newline, and Resend answers a malformed `from`
+ * with 422 validation_error "The domain is invalid" - which reads like a
+ * verification problem but is not one. Note the difference:
+ *
+ *   403  "The <domain> domain is not verified"  -> add/verify it in Resend
+ *   422  "The domain is invalid"                -> the `from` value is malformed
  */
+const SENDER_RE = /^\s*(?:(.*?)\s*<\s*([^<>\s]+@[^<>\s]+)\s*>|([^<>\s]+@[^<>\s]+))\s*$/;
+
+function parseSender(raw) {
+  const value = (raw ?? '').trim();
+  if (!value) return { ok: false, reason: 'EMAIL_FROM is not set' };
+
+  const m = value.match(SENDER_RE);
+  if (!m) {
+    return { ok: false, reason: `EMAIL_FROM is not a valid address: [${value}]`, value };
+  }
+
+  const displayName = (m[1] || '').trim();
+  const address = (m[2] || m[3] || '').trim();
+  const domain = address.split('@')[1]?.toLowerCase() || null;
+
+  if (!domain || !domain.includes('.')) {
+    return { ok: false, reason: `EMAIL_FROM has no usable domain: [${value}]`, value };
+  }
+
+  return {
+    ok: true,
+    value: displayName ? `${displayName} <${address}>` : address,
+    address,
+    domain,
+    displayName,
+  };
+}
+
+/** The trimmed, validated `from` value. Throws rather than sending garbage. */
+function getSender() {
+  const parsed = parseSender(process.env.EMAIL_FROM);
+  if (!parsed.ok) throw new Error(parsed.reason);
+  return parsed.value;
+}
+
 const UNVERIFIABLE_SENDER_DOMAINS = [
   'gmail.com', 'googlemail.com', 'yahoo.com', 'hotmail.com',
   'outlook.com', 'live.com', 'aol.com', 'icloud.com', 'me.com',
 ];
 
+/** Startup diagnostics. Brackets make stray whitespace visible. */
 function checkSenderDomain() {
-  const from = process.env.EMAIL_FROM || '';
-  const match = from.match(/<([^>]+)>/) || from.match(/(\S+@\S+)/);
-  const address = match ? match[1] : null;
-  if (!address) {
-    if (isEmailConfigured) console.warn('EMAIL_FROM is not set or has no address - sends will fail');
+  const raw = process.env.EMAIL_FROM;
+  const parsed = parseSender(raw);
+
+  if (!parsed.ok) {
+    console.error(`EMAIL_FROM problem: ${parsed.reason}`);
+    if (raw !== undefined && raw !== parsed.value) {
+      console.error(`  raw value as received: [${raw}]`);
+    }
     return;
   }
-  const domain = address.split('@')[1]?.toLowerCase();
-  if (domain && UNVERIFIABLE_SENDER_DOMAINS.includes(domain)) {
+
+  console.log(`Email sender: [${parsed.value}]  (domain: ${parsed.domain})`);
+  if ((raw || '') !== parsed.value) {
+    console.warn(`  note: EMAIL_FROM needed trimming. Raw value was [${raw}]`);
+  }
+  if (UNVERIFIABLE_SENDER_DOMAINS.includes(parsed.domain)) {
     console.error(
-      `EMAIL_FROM uses ${domain}, which can never be verified in Resend. ` +
-      'Every send will be rejected. Set EMAIL_FROM to an address on a domain ' +
-      'you own and have verified at https://resend.com/domains'
+      `  ${parsed.domain} can never be verified in Resend - every send will be rejected. ` +
+      'Use an address on a domain you own and have verified at https://resend.com/domains'
     );
+  } else {
+    console.log(`  ${parsed.domain} must be added AND verified at https://resend.com/domains`);
   }
 }
 
 if (isEmailConfigured) checkSenderDomain();
 
-// Send ticket email with QR code(s)
+// Send ticket email with QR code(s)// Send ticket email with QR code(s)
 async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, tickets, shopId }) {
   if (!isEmailConfigured || !resend) {
     throw new EmailNotConfiguredError(
@@ -197,7 +250,7 @@ async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, 
     const ticketWord = tickets.length === 1 ? 'Ticket' : 'Tickets';
 
     return sendViaResend({
-      from: process.env.EMAIL_FROM,
+      from: getSender(),
       to: to,
       subject: `Your ${ticketWord}${subjectEventPart} (${tickets.length} ${ticketWord})`,
       html: `
@@ -302,7 +355,7 @@ async function sendTicketEmail({ to, name, eventName, qrCodeDataUrl, verifyUrl, 
   }
 
   return sendViaResend({
-    from: process.env.EMAIL_FROM,
+    from: getSender(),
     to: to,
     subject: `Your Ticket - ${ticketLabel}`,
     html: `
@@ -369,7 +422,7 @@ async function sendAdminNotification({ subject, message, ticketDetails }) {
 
   try {
     await sendViaResend({
-      from: process.env.EMAIL_FROM,
+      from: getSender(),
       to: process.env.ADMIN_EMAIL,
       subject: `[Admin Alert] ${subject}`,
       html: `
@@ -459,6 +512,8 @@ module.exports = {
   sendAdminNotification,
   sendViaResend,
   assertResendAccepted,
+  parseSender,
+  getSender,
   EmailNotConfiguredError,
   checkSenderDomain,
 };

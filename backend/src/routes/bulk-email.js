@@ -1,6 +1,6 @@
 const express = require('express');
 const db = require('../config/database');
-const { sendViaResend } = require('../services/email');
+const { sendViaResend, getSender } = require('../services/email');
 const authMiddleware = require('../middleware/auth');
 const superAdminMiddleware = require('../middleware/superadmin');
 
@@ -51,7 +51,7 @@ router.post('/test', authMiddleware, superAdminMiddleware, async (req, res) => {
     // resolves to { data, error } rather than throwing, so this used to report
     // success for messages that were never delivered.
     const sent = await sendViaResend({
-      from: process.env.EMAIL_FROM,
+      from: getSender(),
       to: testEmail,
       subject: `[TEST] ${subject}`,
       html: `
@@ -221,7 +221,7 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
         const attachments = [];
 
         await sendViaResend({
-          from: process.env.EMAIL_FROM,
+          from: getSender(),
           to: recipient.email,
           subject: subject,
           html: `
