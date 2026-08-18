@@ -164,6 +164,21 @@ router.post('/create-order',
         if (eventResult.rows.length === 0) {
           return res.status(400).json({ error: 'Event not found: ' + ticketItem.eventId });
         }
+
+        // A ticket type is only valid for the event it belongs to. The foreign
+        // key alone would happily accept another event's type - or another
+        // shop's - so check it here rather than trusting the client.
+        if (ticketItem.ticketTypeId) {
+          const typeResult = await db.query(
+            'SELECT id FROM event_ticket_types WHERE id = $1 AND event_id = $2 AND shop_id = $3',
+            [ticketItem.ticketTypeId, ticketItem.eventId, req.shopId]
+          );
+          if (typeResult.rows.length === 0) {
+            return res.status(400).json({
+              error: 'Ticket type ' + ticketItem.ticketTypeId + ' does not belong to event ' + ticketItem.eventId,
+            });
+          }
+        }
       }
 
       const manualOrderId = `manual-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;

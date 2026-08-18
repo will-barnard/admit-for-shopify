@@ -45,6 +45,98 @@ router.get('/', superAdminMiddleware, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// Needs attention
+//
+// An order whose line items matched no ticket type used to be indistinguishable
+// from a successful one: the log said processed, no tickets existed, and nobody
+// found out until a customer asked where their ticket was. The order pipeline
+// now records those line items on webhook_logs.unmatched_line_items; this is
+// where they surface.
+//
+// Registered BEFORE '/:id' - '/needs-attention' is a single path segment and
+// would otherwise be swallowed by that route.
+// ---------------------------------------------------------------------------
+
+router.get('/needs-attention', superAdminMiddleware, async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
+    const result = await db.query(
+      `SELECT id,
+              shopify_order_id,
+              webhook_type,
+              created_at,
+              processed,
+              tickets_created,
+              error_message,
+              unmatched_line_items,
+              webhook_data->>'name'         AS order_name,
+              webhook_data->>'order_number' AS order_number,
+              COALESCE(
+                NULLIF(TRIM(CONCAT_WS(' ',
+                  webhook_data->'customer'->>'first_name',
+                  webhook_data->'customer'->>'last_name')), ''),
+                webhook_data->>'email'
+              ) AS customer
+         FROM webhook_logs
+        WHERE shop_id = $1
+          AND unmatched_line_items IS NOT NULL
+          AND unmatched_resolved_at IS NULL
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [req.shopId, limit]
+    );
+
+    // The SKUs and variant ids that are not mapped to any ticket type, across
+    // every unresolved order - this is the actual to-do list.
+    const skus = new Map();
+    for (const row of result.rows) {
+      for (const item of row.unmatched_line_items || []) {
+        const key = item.variant_id ? `variant:${item.variant_id}` : `sku:${item.sku}`;
+        const existing = skus.get(key) || {
+          sku: item.sku || null,
+          variant_id: item.variant_id || null,
+          title: item.title || null,
+          orders: 0,
+          units: 0,
+        };
+        existing.orders += 1;
+        existing.units += item.quantity || 1;
+        skus.set(key, existing);
+      }
+    }
+
+    res.json({
+      count: result.rows.length,
+      orders: result.rows,
+      unmapped: [...skus.values()].sort((a, b) => b.units - a.units),
+    });
+  } catch (error) {
+    console.error('Error fetching needs-attention webhooks:', error);
+    res.status(500).json({ error: 'Failed to fetch unmatched orders' });
+  }
+});
+
+// Dismiss one entry. The webhook log is kept - only the flag is cleared - so a
+// deliberate "that was not a ticket" is not the same thing as losing the record.
+router.post('/:id/resolve-unmatched', superAdminMiddleware, async (req, res) => {
+  try {
+    const result = await db.query(
+      `UPDATE webhook_logs SET unmatched_resolved_at = NOW()
+        WHERE id = $1 AND shop_id = $2 AND unmatched_line_items IS NOT NULL
+        RETURNING id`,
+      [req.params.id, req.shopId]
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'No unmatched entry for that webhook' });
+    }
+    res.json({ message: 'Dismissed', id: result.rows[0].id });
+  } catch (error) {
+    console.error('Error resolving unmatched webhook:', error);
+    res.status(500).json({ error: 'Failed to dismiss entry' });
+  }
+});
+
 // Get webhook log by ID with full webhook data (protected, admin only)
 router.get('/:id', superAdminMiddleware, async (req, res) => {
   try {
@@ -75,6 +167,7 @@ router.get('/stats/summary', superAdminMiddleware, async (req, res) => {
         COUNT(*) FILTER (WHERE processed = TRUE) as processed_webhooks,
         COUNT(*) FILTER (WHERE processed = FALSE) as unprocessed_webhooks,
         COUNT(*) FILTER (WHERE error_message IS NOT NULL) as webhooks_with_errors,
+        COUNT(*) FILTER (WHERE unmatched_line_items IS NOT NULL AND unmatched_resolved_at IS NULL) as needs_attention,
         SUM(tickets_created) as total_tickets_created
       FROM webhook_logs
       WHERE shop_id = $1
@@ -143,7 +236,8 @@ router.post('/:id/retry', superAdminMiddleware, checkLockdown, async (req, res) 
     // Clear the previous outcome so the service can write a fresh one.
     await db.query(
       `UPDATE webhook_logs
-          SET processed = FALSE, error_message = NULL, processed_at = NULL, tickets_created = NULL
+          SET processed = FALSE, error_message = NULL, processed_at = NULL, tickets_created = NULL,
+              unmatched_line_items = NULL, unmatched_resolved_at = NULL
         WHERE id = $1 AND shop_id = $2`,
       [id, req.shopId]
     );

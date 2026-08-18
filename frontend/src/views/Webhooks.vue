@@ -38,10 +38,86 @@
             <div class="stat-label">With Errors</div>
             <div class="stat-value">{{ stats.webhooks_with_errors || 0 }}</div>
           </div>
+          <div class="stat-card" :class="{ error: (stats.needs_attention || 0) > 0 }">
+            <div class="stat-label">Needs Attention</div>
+            <div class="stat-value">{{ stats.needs_attention || 0 }}</div>
+          </div>
           <div class="stat-card">
             <div class="stat-label">Tickets Affected</div>
             <div class="stat-value">{{ stats.total_tickets_created || 0 }}</div>
           </div>
+        </div>
+
+        <!-- Needs attention: orders whose line items matched no ticket type -->
+        <div v-if="needsAttention.orders.length" class="attention-card">
+          <div class="attention-head">
+            <h2>Needs attention</h2>
+            <span class="attention-count">{{ needsAttention.orders.length }}</span>
+          </div>
+          <p class="attention-lede">
+            These orders arrived and were processed, but one or more line items matched no
+            ticket type - so no ticket was issued for them. Map the variant or SKU to a ticket
+            type on the event, then retry the order.
+          </p>
+
+          <div v-if="needsAttention.unmapped.length" class="unmapped-summary">
+            <span class="unmapped-label">Unmapped:</span>
+            <span v-for="u in needsAttention.unmapped" :key="(u.variant_id || '') + (u.sku || '')" class="unmapped-chip">
+              <strong>{{ u.sku || u.title || 'no SKU' }}</strong>
+              <template v-if="u.variant_id"> · variant {{ u.variant_id }}</template>
+              <em>{{ u.units }} unit{{ u.units === 1 ? '' : 's' }} across {{ u.orders }} order{{ u.orders === 1 ? '' : 's' }}</em>
+            </span>
+          </div>
+
+          <table class="attention-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Order</th>
+                <th>Customer</th>
+                <th>Didn't match</th>
+                <th>Tickets issued</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in needsAttention.orders" :key="row.id">
+                <td>{{ formatDate(row.created_at) }}</td>
+                <td>{{ row.order_name || ('#' + (row.order_number || row.shopify_order_id)) }}</td>
+                <td>{{ row.customer || '—' }}</td>
+                <td>
+                  <div v-for="(item, i) in row.unmatched_line_items" :key="i" class="unmatched-item">
+                    <strong>{{ item.sku || 'no SKU' }}</strong>
+                    <span v-if="item.title"> — {{ item.title }}</span>
+                    <span v-if="item.quantity > 1" class="qty">×{{ item.quantity }}</span>
+                  </div>
+                </td>
+                <td>
+                  <span :class="row.tickets_created > 0 ? 'partial' : 'none-issued'">
+                    {{ row.tickets_created > 0 ? row.tickets_created + ' (partial)' : 'none' }}
+                  </span>
+                </td>
+                <td class="attention-actions">
+                  <button class="btn-mini" @click="viewDetails(row)">View</button>
+                  <button
+                    class="btn-mini primary"
+                    :disabled="retryingUnmatched.has(row.id)"
+                    title="Re-run this order through the same pipeline. Do this after mapping the SKU."
+                    @click="retryUnmatched(row)"
+                  >
+                    {{ retryingUnmatched.has(row.id) ? 'Retrying…' : 'Retry' }}
+                  </button>
+                  <button
+                    class="btn-mini"
+                    title="Not a ticket, or already handled - remove it from this list."
+                    @click="dismissUnmatched(row)"
+                  >
+                    Dismiss
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
 
         <!-- Filters -->
@@ -265,6 +341,10 @@ export default {
     const retryingWebhooks = ref(new Set());
     const notification = ref({ show: false, message: '', type: 'success' });
     const selectedWebhookType = ref('');
+
+    // Orders that produced no ticket for at least one line item.
+    const needsAttention = ref({ count: 0, orders: [], unmapped: [] });
+    const retryingUnmatched = ref(new Set());
     
     // Available webhook types for manual selection
     const availableWebhookTypes = ref([
@@ -280,6 +360,58 @@ export default {
         stats.value = response.data;
       } catch (err) {
         console.error('Error fetching webhook stats:', err);
+      }
+    };
+
+    const fetchNeedsAttention = async () => {
+      try {
+        const response = await axios.get('/api/webhooks/needs-attention');
+        needsAttention.value = {
+          count: response.data.count || 0,
+          orders: response.data.orders || [],
+          unmapped: response.data.unmapped || [],
+        };
+      } catch (err) {
+        console.error('Error fetching needs-attention orders:', err);
+      }
+    };
+
+    const refreshAll = async () => {
+      await Promise.all([fetchStats(), fetchWebhooks(), fetchNeedsAttention()]);
+    };
+
+    const retryUnmatched = async (row) => {
+      // Vue does not track Set mutations, so replace the Set to force a render.
+      retryingUnmatched.value = new Set(retryingUnmatched.value).add(row.id);
+      try {
+        const response = await axios.post(`/api/webhooks/${row.id}/retry`, {});
+        const created = response.data?.result?.tickets?.length || 0;
+        const stillUnmatched = response.data?.result?.unmatched?.length || 0;
+        if (created > 0 && stillUnmatched === 0) {
+          showNotification(`Order replayed - ${created} ticket(s) created`, 'success');
+        } else if (stillUnmatched > 0) {
+          showNotification('Replayed, but some line items still match no ticket type', 'error');
+        } else {
+          showNotification('Replayed, but no tickets were created', 'error');
+        }
+      } catch (err) {
+        showNotification(err.response?.data?.error || 'Retry failed', 'error');
+      } finally {
+        const next = new Set(retryingUnmatched.value);
+        next.delete(row.id);
+        retryingUnmatched.value = next;
+        await refreshAll();
+      }
+    };
+
+    const dismissUnmatched = async (row) => {
+      const label = row.order_name || row.shopify_order_id;
+      if (!confirm(`Dismiss order ${label}? The webhook log is kept - it just leaves this list.`)) return;
+      try {
+        await axios.post(`/api/webhooks/${row.id}/resolve-unmatched`);
+        await refreshAll();
+      } catch (err) {
+        showNotification(err.response?.data?.error || 'Failed to dismiss', 'error');
       }
     };
 
@@ -488,6 +620,7 @@ export default {
       
       fetchStats();
       fetchWebhooks();
+      fetchNeedsAttention();
     });
 
     return {
@@ -504,6 +637,11 @@ export default {
       selectedWebhookType,
       availableWebhookTypes,
       showNotification,
+      needsAttention,
+      retryingUnmatched,
+      fetchNeedsAttention,
+      retryUnmatched,
+      dismissUnmatched,
       fetchWebhooks,
       viewDetails,
       closeModal,
@@ -1107,4 +1245,49 @@ export default {
     padding: 0.75rem;
   }
 }
+
+/* Needs attention */
+.attention-card {
+  background: #fffaf2;
+  border: 1px solid #ffd9a0;
+  border-left: 5px solid #f0a02a;
+  border-radius: 10px;
+  padding: 20px 24px;
+  margin-bottom: 24px;
+}
+.attention-head { display: flex; align-items: center; gap: 10px; }
+.attention-head h2 { margin: 0; font-size: 18px; color: #8a5a00; }
+.attention-count {
+  background: #f0a02a; color: white; border-radius: 12px;
+  padding: 2px 10px; font-size: 13px; font-weight: 700;
+}
+.attention-lede { margin: 8px 0 14px; font-size: 13px; color: #7a6141; max-width: 76ch; }
+
+.unmapped-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
+.unmapped-label { font-size: 12px; font-weight: 600; color: #8a5a00; }
+.unmapped-chip {
+  background: white; border: 1px solid #ffd9a0; border-radius: 12px;
+  padding: 4px 10px; font-size: 12px; color: #6b5330;
+  display: inline-flex; gap: 6px; align-items: baseline;
+}
+.unmapped-chip em { color: #a08a68; font-style: normal; }
+
+.attention-table { width: 100%; border-collapse: collapse; font-size: 13px; background: white; border-radius: 8px; overflow: hidden; }
+.attention-table th {
+  text-align: left; padding: 10px 12px; background: #fff3e0;
+  color: #8a5a00; font-weight: 600; font-size: 12px; white-space: nowrap;
+}
+.attention-table td { padding: 10px 12px; border-top: 1px solid #f3e4cd; vertical-align: top; }
+.unmatched-item { margin-bottom: 2px; }
+.unmatched-item .qty { color: #999; margin-left: 4px; }
+.none-issued { color: #c33; font-weight: 600; }
+.partial { color: #8a5a00; font-weight: 600; }
+.attention-actions { white-space: nowrap; }
+.btn-mini {
+  padding: 5px 10px; margin-right: 6px; border: 1px solid #ddd; background: white;
+  border-radius: 6px; font-size: 12px; cursor: pointer;
+}
+.btn-mini:hover { background: #f7f7f7; }
+.btn-mini.primary { border-color: #667eea; color: #667eea; }
+.btn-mini:disabled { opacity: 0.5; cursor: not-allowed; }
 </style>

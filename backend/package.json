@@ -12,9 +12,10 @@
     "test:orders": "node test/shopify-orders.test.js",
     "check:tenancy": "node test/check-tenancy.js",
     "test:tenancy": "node test/tenancy.test.js",
-    "test": "npm run check:tenancy && npm run test:email && npm run test:orders && npm run test:tenancy && npm run test:shopify-auth",
+    "test": "npm run check:tenancy && npm run test:email && npm run test:orders && npm run test:tenancy && npm run test:shopify-auth && npm run test:ticket-types",
     "test:shopify-auth": "node test/shopify-auth.test.js",
-    "test:email": "node test/email.test.js"
+    "test:email": "node test/email.test.js",
+    "test:ticket-types": "node test/ticket-types.test.js"
   },
   "dependencies": {
     "axios": "^1.6.0",

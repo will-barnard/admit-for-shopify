@@ -32,7 +32,14 @@
           <div class="result-card" :class="resultClass">
             <div class="result-icon">{{ resultIcon }}</div>
             <h2>{{ resultTitle }}</h2>
-            
+
+            <!-- The type is what the door acts on: a VIP, a child pass and a
+                 Saturday-only pass all look the same otherwise. Keep it above
+                 the detail rows so it is read before anything else. -->
+            <div v-if="ticketData && ticketData.ticketType" class="ticket-type-banner">
+              {{ ticketData.ticketType }}
+            </div>
+
             <div v-if="ticketData" class="ticket-details">
               <div class="detail-row">
                 <span class="label">Name:</span>
@@ -865,5 +872,19 @@ video {
   color: #333;
   font-size: 16px;
   font-weight: 600;
+}
+
+.ticket-type-banner {
+  margin: 4px 0 14px;
+  padding: 10px 16px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.22);
+  border: 2px solid rgba(255, 255, 255, 0.5);
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  text-align: center;
+  word-break: break-word;
 }
 </style>

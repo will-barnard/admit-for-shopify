@@ -39,6 +39,7 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
         message: 'This event has been archived. Tickets cannot be scanned.',
         name: ticket.name,
         eventName: ticket.event_name,
+        ticketType: ticket.ticket_type_name || null,
       });
     }
 
@@ -49,6 +50,7 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
         message: `Ticket is ${ticket.status}.`,
         name: ticket.name,
         eventName: ticket.event_name,
+        ticketType: ticket.ticket_type_name || null,
       });
     }
 
@@ -66,6 +68,7 @@ router.get('/:uuid', authMiddleware, checkLockdown, async (req, res) => {
         scannedOn: scannedDate,
         name: ticket.name,
         eventName: ticket.event_name,
+        ticketType: ticket.ticket_type_name || null,
       });
     }
 

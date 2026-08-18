@@ -473,7 +473,22 @@ async function runMigrations() {
         ) THEN
           ALTER TABLE webhook_logs ADD COLUMN unmatched_line_items JSONB;
         END IF;
+
+        -- Lets an operator clear a needs-attention entry they have dealt with
+        -- (or decided is not a ticket) without deleting the webhook log.
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'webhook_logs' AND column_name = 'unmatched_resolved_at'
+        ) THEN
+          ALTER TABLE webhook_logs ADD COLUMN unmatched_resolved_at TIMESTAMP;
+        END IF;
       END $$;
+    `);
+
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_webhook_logs_unmatched
+        ON webhook_logs (shop_id, created_at DESC)
+        WHERE unmatched_line_items IS NOT NULL AND unmatched_resolved_at IS NULL
     `);
     console.log('\u2713 webhook_logs.unmatched_line_items ensured');
 

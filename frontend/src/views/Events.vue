@@ -53,11 +53,28 @@
               <span v-if="event.event_date"><strong>Date:</strong> {{ formatDate(event.event_date) }}</span>
               <span v-if="event.event_time"><strong>Time:</strong> {{ event.event_time }}</span>
               <span v-if="event.location"><strong>Location:</strong> {{ event.location }}</span>
-              <span><strong>SKU:</strong> {{ event.sku }}</span>
               <span v-if="event.archived && event.archived_at">
                 <strong>Archived:</strong> {{ formatDate(event.archived_at) }}
               </span>
             </div>
+
+            <!-- Ticket types. A single-type event reads as one quiet line; a
+                 multi-type event gets one chip per type. -->
+            <div class="ticket-types">
+              <span
+                v-for="tt in (event.ticket_types || [])"
+                :key="tt.id"
+                class="type-chip"
+                :class="{ unmapped: !isMapped(tt), 'type-inactive': tt.active === false }"
+                :title="mappingLabel(tt)"
+              >
+                <span class="type-name">{{ tt.name }}</span>
+                <span class="type-count">{{ tt.ticket_count || 0 }}<template v-if="tt.capacity">/{{ tt.capacity }}</template></span>
+                <span v-if="!isMapped(tt)" class="type-warn" title="No Shopify variant or SKU - orders will never match this type">not mapped</span>
+              </span>
+              <span v-if="!(event.ticket_types || []).length" class="type-chip unmapped">no ticket types</span>
+            </div>
+
             <div class="event-stats">
               <span class="stat">{{ event.ticket_count || 0 }} tickets</span>
               <span class="stat">{{ event.checkin_count || 0 }} checked in</span>
@@ -120,11 +137,64 @@
             <label>Location</label>
             <input v-model="form.location" type="text" placeholder="e.g. Convention Center, Hall A" />
           </div>
+
+          <!-- Ticket types -->
           <div class="form-group">
-            <label>Shopify SKU *</label>
-            <input v-model="form.sku" type="text" required placeholder="e.g. summer-fest-2025" />
-            <p class="hint">Must match the SKU in your Shopify product</p>
+            <div class="section-head">
+              <label>{{ types.length > 1 ? 'Ticket types' : 'Ticket type' }}</label>
+              <button type="button" class="btn-link" @click="addType">+ Add another</button>
+            </div>
+            <p class="hint">
+              Each type maps to one Shopify variant. Orders match on variant ID first, then SKU.
+              One type is all a simple event needs.
+            </p>
+
+            <div v-for="(t, i) in types" :key="t.key" class="type-row">
+              <div class="type-row-main">
+                <input
+                  v-model="t.name"
+                  type="text"
+                  class="type-input name"
+                  required
+                  placeholder="Ticket type name, e.g. General Admission"
+                />
+                <button
+                  type="button"
+                  class="btn-remove"
+                  :disabled="types.length <= 1 || (t.ticket_count || 0) > 0"
+                  :title="removeTitle(t)"
+                  @click="removeType(i)"
+                >
+                  Remove
+                </button>
+              </div>
+              <div class="type-row-fields">
+                <label class="mini">
+                  Shopify variant ID
+                  <input v-model="t.shopify_variant_id" type="text" class="type-input" placeholder="e.g. 45123456789012" />
+                </label>
+                <label class="mini">
+                  SKU (fallback)
+                  <input v-model="t.shopify_sku" type="text" class="type-input" placeholder="e.g. summer-fest-vip" />
+                </label>
+                <label class="mini narrow">
+                  Capacity
+                  <input v-model="t.capacity" type="number" min="0" class="type-input" placeholder="none" />
+                </label>
+              </div>
+              <div class="type-row-foot">
+                <label class="checkbox-label small">
+                  <input v-model="t.active" type="checkbox" />
+                  Selling
+                </label>
+                <span v-if="(t.ticket_count || 0) > 0" class="issued-note">{{ t.ticket_count }} issued</span>
+                <span v-if="!t.shopify_variant_id && !t.shopify_sku" class="unmapped-note">
+                  Not mapped - Shopify orders will never create this ticket
+                </span>
+              </div>
+            </div>
           </div>
+
           <div class="form-group">
             <label class="checkbox-label">
               <input v-model="form.active" type="checkbox" />
@@ -152,6 +222,8 @@ import axios from 'axios';
 import ChangePasswordModal from '@/components/ChangePasswordModal.vue';
 import PageHeader from '@/components/PageHeader.vue';
 
+let rowKey = 0;
+
 export default {
   name: 'Events',
   components: { ChangePasswordModal, PageHeader },
@@ -175,9 +247,39 @@ export default {
       event_date: '',
       event_time: '',
       location: '',
-      sku: '',
       active: true
     });
+
+    // Editable ticket-type rows. `id` is present for rows that already exist in
+    // the database; rows without one are created on save. `original` holds the
+    // set of ids we started with, so removals become DELETEs.
+    const types = ref([]);
+    const originalTypeIds = ref([]);
+
+    const blankType = (name = '') => ({
+      key: ++rowKey,
+      id: null,
+      name,
+      shopify_variant_id: '',
+      shopify_sku: '',
+      capacity: '',
+      active: true,
+      ticket_count: 0
+    });
+
+    const isMapped = (t) => Boolean(t.shopify_variant_id || t.shopify_sku);
+
+    const mappingLabel = (t) => {
+      if (t.shopify_variant_id) return `Variant ${t.shopify_variant_id}`;
+      if (t.shopify_sku) return `SKU ${t.shopify_sku}`;
+      return 'Not mapped to Shopify';
+    };
+
+    const removeTitle = (t) => {
+      if ((t.ticket_count || 0) > 0) return 'Tickets have been issued for this type. Untick "Selling" instead.';
+      if (types.value.length <= 1) return 'An event needs at least one ticket type';
+      return 'Remove this ticket type';
+    };
 
     const resetForm = () => {
       form.name = '';
@@ -185,8 +287,9 @@ export default {
       form.event_date = '';
       form.event_time = '';
       form.location = '';
-      form.sku = '';
       form.active = true;
+      types.value = [blankType('General Admission')];
+      originalTypeIds.value = [];
       modalError.value = '';
     };
 
@@ -209,17 +312,45 @@ export default {
       showModal.value = true;
     };
 
-    const openEditModal = (event) => {
+    const openEditModal = async (event) => {
+      resetForm();
       editingEvent.value = event;
       form.name = event.name;
       form.description = event.description || '';
       form.event_date = event.event_date ? event.event_date.split('T')[0] : '';
       form.event_time = event.event_time || '';
       form.location = event.location || '';
-      form.sku = event.sku;
       form.active = event.active;
-      modalError.value = '';
       showModal.value = true;
+
+      // The list endpoint already embeds ticket_types; re-fetch so an edit
+      // always works from current data rather than a stale list.
+      let rows = event.ticket_types || [];
+      try {
+        const res = await axios.get(`/api/events/${event.id}/ticket-types`);
+        rows = res.data;
+      } catch (err) {
+        /* fall back to the embedded copy */
+      }
+      types.value = (rows.length ? rows : [{ name: 'General Admission' }]).map((tt) => ({
+        key: ++rowKey,
+        id: tt.id || null,
+        name: tt.name || '',
+        shopify_variant_id: tt.shopify_variant_id || '',
+        shopify_sku: tt.shopify_sku || '',
+        capacity: tt.capacity ?? '',
+        active: tt.active !== false,
+        ticket_count: Number(tt.ticket_count || 0)
+      }));
+      originalTypeIds.value = types.value.filter((t) => t.id).map((t) => t.id);
+    };
+
+    const addType = () => { types.value.push(blankType('')); };
+
+    const removeType = (i) => {
+      const t = types.value[i];
+      if (types.value.length <= 1 || (t.ticket_count || 0) > 0) return;
+      types.value.splice(i, 1);
     };
 
     const closeModal = () => {
@@ -227,22 +358,69 @@ export default {
       editingEvent.value = null;
     };
 
+    // Shape a row for the API. Empty strings become null so the backend's
+    // uniqueness rules and "is it mapped?" checks see NULL, not ''.
+    const typePayload = (t, i) => ({
+      id: t.id || undefined,
+      name: (t.name || '').trim(),
+      shopify_variant_id: (t.shopify_variant_id || '').trim() || null,
+      shopify_sku: (t.shopify_sku || '').trim() || null,
+      capacity: t.capacity === '' || t.capacity === null ? null : Number(t.capacity),
+      sort_order: i,
+      active: t.active !== false
+    });
+
     const saveEvent = async () => {
       saving.value = true;
       modalError.value = '';
+
+      const rows = types.value.map(typePayload);
+      if (rows.some((r) => !r.name)) {
+        modalError.value = 'Every ticket type needs a name';
+        saving.value = false;
+        return;
+      }
+      const mapKeys = rows
+        .flatMap((r) => [r.shopify_variant_id && `v:${r.shopify_variant_id}`, r.shopify_sku && `s:${r.shopify_sku.toLowerCase()}`])
+        .filter(Boolean);
+      if (new Set(mapKeys).size !== mapKeys.length) {
+        modalError.value = 'Two ticket types share the same variant ID or SKU';
+        saving.value = false;
+        return;
+      }
+
       try {
         const payload = { ...form };
         if (!payload.event_date) payload.event_date = null;
 
-        if (editingEvent.value) {
-          await axios.put(`/api/events/${editingEvent.value.id}`, payload);
+        if (!editingEvent.value) {
+          await axios.post('/api/events', { ...payload, ticket_types: rows });
         } else {
-          await axios.post('/api/events', payload);
+          const id = editingEvent.value.id;
+          await axios.put(`/api/events/${id}`, payload);
+
+          // Create, then update, then delete. Doing deletes last means
+          // replacing an event's only ticket type never trips the
+          // "must keep at least one" guard.
+          for (const r of rows.filter((r) => !r.id)) {
+            await axios.post(`/api/events/${id}/ticket-types`, r);
+          }
+          for (const r of rows.filter((r) => r.id)) {
+            await axios.put(`/api/events/${id}/ticket-types/${r.id}`, r);
+          }
+          const keptIds = new Set(rows.filter((r) => r.id).map((r) => r.id));
+          for (const goneId of originalTypeIds.value.filter((tid) => !keptIds.has(tid))) {
+            await axios.delete(`/api/events/${id}/ticket-types/${goneId}`);
+          }
         }
         closeModal();
         await loadEvents();
       } catch (err) {
-        modalError.value = err.response?.data?.error || 'Failed to save event';
+        modalError.value = err.response?.data?.error
+          || err.response?.data?.errors?.[0]?.msg
+          || 'Failed to save event';
+        // The event itself may already have saved; refresh so the list is honest.
+        await loadEvents();
       } finally {
         saving.value = false;
       }
@@ -295,6 +473,7 @@ export default {
     return {
       authStore, events, loading, error, isChangePasswordOpen, showModal,
       editingEvent, saving, modalError, form, showArchived,
+      types, addType, removeType, isMapped, mappingLabel, removeTitle,
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
       archiveEvent, unarchiveEvent, loadEvents,
       formatDate, showChangePassword, handleLogout
@@ -335,6 +514,19 @@ export default {
 .event-desc { color: #666; margin: 0 0 12px 0; font-size: 14px; }
 
 .event-meta { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: #555; margin-bottom: 8px; }
+
+.ticket-types { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.type-chip {
+  display: inline-flex; align-items: baseline; gap: 8px;
+  background: #eef0fb; color: #3f4a8a; border: 1px solid #dfe3f7;
+  padding: 4px 10px; border-radius: 12px; font-size: 12px;
+}
+.type-chip .type-name { font-weight: 600; }
+.type-chip .type-count { color: #5c68a8; }
+.type-chip.type-inactive { opacity: 0.55; }
+.type-chip.unmapped { background: #fff6e5; border-color: #ffe0a3; color: #8a5a00; }
+.type-warn { font-weight: 600; }
+
 .event-stats { display: flex; gap: 16px; font-size: 13px; }
 .event-stats .stat { background: #f0f0f0; padding: 4px 10px; border-radius: 12px; }
 
@@ -354,21 +546,40 @@ export default {
 .btn-primary:hover { background: #5568d3; }
 .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
 .btn-secondary { padding: 10px 24px; background: white; color: #667eea; border: 1px solid #667eea; border-radius: 8px; cursor: pointer; font-size: 14px; }
+.btn-link { background: none; border: none; color: #667eea; cursor: pointer; font-size: 13px; padding: 0; }
+.btn-link:hover { text-decoration: underline; }
 
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
-.modal { background: white; padding: 32px; border-radius: 12px; width: 100%; max-width: 560px; max-height: 90vh; overflow-y: auto; }
+.modal { background: white; padding: 32px; border-radius: 12px; width: 100%; max-width: 620px; max-height: 90vh; overflow-y: auto; }
 .modal h3 { margin: 0 0 24px 0; font-size: 22px; color: #333; }
 
 .form-group { margin-bottom: 18px; }
 .form-group label { display: block; margin-bottom: 6px; font-weight: 500; color: #333; font-size: 14px; }
-.form-group input[type="text"], .form-group input[type="date"], .form-group textarea {
+.form-group input[type="text"], .form-group input[type="date"], .form-group input[type="number"], .form-group textarea {
   width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; box-sizing: border-box;
 }
 .form-group textarea { resize: vertical; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.hint { font-size: 12px; color: #888; margin-top: 4px; }
+.hint { font-size: 12px; color: #888; margin-top: 4px; margin-bottom: 10px; }
 .checkbox-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .checkbox-label input { width: auto; }
+.checkbox-label.small { font-size: 13px; font-weight: 400; margin: 0; }
+
+.section-head { display: flex; justify-content: space-between; align-items: center; }
+.section-head label { margin-bottom: 0; }
+
+.type-row { border: 1px solid #e6e6e6; border-radius: 8px; padding: 12px; margin-bottom: 10px; background: #fbfbfd; }
+.type-row-main { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.type-row-main .name { flex: 1; font-weight: 600; }
+.type-row-fields { display: grid; grid-template-columns: 1fr 1fr 90px; gap: 8px; }
+.type-row-fields .mini { font-size: 11px; color: #777; font-weight: 400; margin: 0; }
+.type-row-fields .mini input { margin-top: 3px; }
+.type-input { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; box-sizing: border-box; }
+.type-row-foot { display: flex; align-items: center; gap: 14px; margin-top: 8px; flex-wrap: wrap; }
+.issued-note { font-size: 12px; color: #666; }
+.unmapped-note { font-size: 12px; color: #8a5a00; }
+.btn-remove { padding: 6px 12px; border: 1px solid #fcc; color: #c33; background: white; border-radius: 6px; cursor: pointer; font-size: 12px; }
+.btn-remove:disabled { opacity: 0.35; cursor: not-allowed; }
 
 .modal-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
 

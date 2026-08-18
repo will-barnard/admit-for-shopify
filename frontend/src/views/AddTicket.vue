@@ -65,10 +65,24 @@
               <div class="ticket-fields">
                 <div class="form-group">
                   <label>Event *</label>
-                  <select v-model="ticket.eventId" required>
+                  <select v-model="ticket.eventId" required @change="onEventChange(ticket)">
                     <option value="">Select event</option>
                     <option v-for="event in events" :key="event.id" :value="event.id">{{ event.name }}</option>
                   </select>
+                </div>
+
+                <!-- Only asked for when the event actually has a choice to make.
+                     A single-type event selects itself and stays out of the way. -->
+                <div v-if="typesFor(ticket.eventId).length > 1" class="form-group">
+                  <label>Ticket Type *</label>
+                  <select v-model="ticket.ticketTypeId" required>
+                    <option value="">Select type</option>
+                    <option v-for="t in typesFor(ticket.eventId)" :key="t.id" :value="t.id">{{ t.name }}</option>
+                  </select>
+                </div>
+                <div v-else-if="typesFor(ticket.eventId).length === 1" class="form-group type-fixed">
+                  <label>Ticket Type</label>
+                  <p class="fixed-value">{{ typesFor(ticket.eventId)[0].name }}</p>
                 </div>
 
                 <div class="form-group">
@@ -152,6 +166,7 @@ export default {
       email: '',
       tickets: [{
         eventId: '',
+        ticketTypeId: '',
         name: '',
         quantity: 1,
       }]
@@ -175,9 +190,24 @@ export default {
       }
     };
 
+    // Active ticket types for an event, as returned by /api/events/list/active.
+    const typesFor = (eventId) => {
+      if (!eventId) return [];
+      const ev = events.value.find((e) => String(e.id) === String(eventId));
+      return (ev && ev.ticket_types) || [];
+    };
+
+    // Changing the event invalidates any previously chosen type. When the new
+    // event has exactly one, choose it silently so the field never appears.
+    const onEventChange = (ticket) => {
+      const types = typesFor(ticket.eventId);
+      ticket.ticketTypeId = types.length === 1 ? types[0].id : '';
+    };
+
     const addTicket = () => {
       orderData.tickets.push({
         eventId: '',
+        ticketTypeId: '',
         name: '',
         quantity: 1,
       });
@@ -198,11 +228,18 @@ export default {
         const payload = {
           customerName: orderData.customerName,
           email: includeEmail.value ? orderData.email : null,
-          tickets: orderData.tickets.map(ticket => ({
-            eventId: ticket.eventId,
-            name: ticket.name,
-            quantity: ticket.quantity
-          }))
+          tickets: orderData.tickets.map(ticket => {
+            // An event with one type resolves server-side, so send null rather
+            // than a guess if nothing was picked.
+            const types = typesFor(ticket.eventId);
+            const typeId = ticket.ticketTypeId || (types.length === 1 ? types[0].id : null);
+            return {
+              eventId: ticket.eventId,
+              ticketTypeId: typeId || null,
+              name: ticket.name,
+              quantity: ticket.quantity
+            };
+          })
         };
 
         const response = await axios.post('/api/tickets/create-order', payload);
@@ -231,6 +268,7 @@ export default {
       orderData.email = '';
       orderData.tickets = [{
         eventId: '',
+        ticketTypeId: '',
         name: '',
         quantity: 1,
       }];
@@ -254,6 +292,8 @@ export default {
       success,
       includeEmail,
       totalTickets,
+      typesFor,
+      onEventChange,
       handleSubmit,
       addTicket,
       removeTicket,
@@ -368,6 +408,16 @@ input:focus, select:focus {
 
 .ticket-fields .form-group {
   margin-bottom: 0;
+}
+
+.type-fixed .fixed-value {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px dashed #ddd;
+  border-radius: 6px;
+  color: #666;
+  font-size: 14px;
+  background: #fafafa;
 }
 
 .checkbox-wrapper {
