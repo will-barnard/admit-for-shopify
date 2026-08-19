@@ -26,6 +26,10 @@ const SPEC = [
   { key: 'SHOPIFY_API_VERSION', required: false, note: "defaults to '2026-07'" },
   { key: 'SHOPIFY_SCOPES', required: false, note: "defaults to 'read_orders'" },
   { key: 'SHOPIFY_API_KEY', required: false, note: 'legacy Shopify Flow shared secret' },
+
+  { key: 'TRUST_PROXY_HOPS', required: false, note: "defaults to '2'; wrong value breaks login rate limiting by IP" },
+  { key: 'BULK_EMAIL_INTERVAL_MS', required: false, note: "defaults to '6000' between bulk messages" },
+  { key: 'EMAIL_DAILY_LIMIT', required: false, note: "defaults to '100' successful sends per shop per day" },
 ];
 
 function reportEnvironment() {
