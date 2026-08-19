@@ -70,6 +70,7 @@ router.get('/needs-attention', superAdminMiddleware, async (req, res) => {
               tickets_created,
               error_message,
               unmatched_line_items,
+              capacity_warnings,
               webhook_data->>'name'         AS order_name,
               webhook_data->>'order_number' AS order_number,
               COALESCE(
@@ -80,7 +81,7 @@ router.get('/needs-attention', superAdminMiddleware, async (req, res) => {
               ) AS customer
          FROM webhook_logs
         WHERE shop_id = $1
-          AND unmatched_line_items IS NOT NULL
+          AND (unmatched_line_items IS NOT NULL OR capacity_warnings IS NOT NULL)
           AND unmatched_resolved_at IS NULL
         ORDER BY created_at DESC
         LIMIT $2`,
@@ -106,10 +107,31 @@ router.get('/needs-attention', superAdminMiddleware, async (req, res) => {
       }
     }
 
+    // The same aggregation for capacity: which ticket types are oversold, and
+    // by how much across every unresolved order.
+    const oversold = new Map();
+    for (const row of result.rows) {
+      for (const warning of row.capacity_warnings || []) {
+        const existing = oversold.get(warning.ticket_type_id) || {
+          ticket_type_id: warning.ticket_type_id,
+          name: warning.name,
+          capacity: warning.capacity,
+          orders: 0,
+          over_by: 0,
+        };
+        existing.orders += 1;
+        existing.over_by += warning.over_by || 0;
+        // The latest reading is the most accurate.
+        existing.sold = warning.sold + warning.requested;
+        oversold.set(warning.ticket_type_id, existing);
+      }
+    }
+
     res.json({
       count: result.rows.length,
       orders: result.rows,
       unmapped: [...skus.values()].sort((a, b) => b.units - a.units),
+      oversold: [...oversold.values()].sort((a, b) => b.over_by - a.over_by),
     });
   } catch (error) {
     console.error('Error fetching needs-attention webhooks:', error);
@@ -123,7 +145,8 @@ router.post('/:id/resolve-unmatched', superAdminMiddleware, async (req, res) => 
   try {
     const result = await db.query(
       `UPDATE webhook_logs SET unmatched_resolved_at = NOW()
-        WHERE id = $1 AND shop_id = $2 AND unmatched_line_items IS NOT NULL
+        WHERE id = $1 AND shop_id = $2
+          AND (unmatched_line_items IS NOT NULL OR capacity_warnings IS NOT NULL)
         RETURNING id`,
       [req.params.id, req.shopId]
     );
@@ -167,7 +190,8 @@ router.get('/stats/summary', superAdminMiddleware, async (req, res) => {
         COUNT(*) FILTER (WHERE processed = TRUE) as processed_webhooks,
         COUNT(*) FILTER (WHERE processed = FALSE) as unprocessed_webhooks,
         COUNT(*) FILTER (WHERE error_message IS NOT NULL) as webhooks_with_errors,
-        COUNT(*) FILTER (WHERE unmatched_line_items IS NOT NULL AND unmatched_resolved_at IS NULL) as needs_attention,
+        COUNT(*) FILTER (WHERE (unmatched_line_items IS NOT NULL OR capacity_warnings IS NOT NULL)
+                           AND unmatched_resolved_at IS NULL) as needs_attention,
         SUM(tickets_created) as total_tickets_created
       FROM webhook_logs
       WHERE shop_id = $1
@@ -237,7 +261,7 @@ router.post('/:id/retry', superAdminMiddleware, checkLockdown, async (req, res) 
     await db.query(
       `UPDATE webhook_logs
           SET processed = FALSE, error_message = NULL, processed_at = NULL, tickets_created = NULL,
-              unmatched_line_items = NULL, unmatched_resolved_at = NULL
+              unmatched_line_items = NULL, capacity_warnings = NULL, unmatched_resolved_at = NULL
         WHERE id = $1 AND shop_id = $2`,
       [id, req.shopId]
     );

@@ -55,10 +55,21 @@
             <span class="attention-count">{{ needsAttention.orders.length }}</span>
           </div>
           <p class="attention-lede">
-            These orders arrived and were processed, but one or more line items matched no
-            ticket type - so no ticket was issued for them. Map the variant or SKU to a ticket
-            type on the event, then retry the order.
+            Orders that arrived and were processed, but need a look: a line item matched no
+            ticket type (so no ticket was issued for it), or the order pushed a ticket type
+            past its capacity. A paid order is never refused for capacity - Shopify's own
+            inventory is what should have stopped the sale, so an overage here means the two
+            disagree.
           </p>
+
+          <div v-if="needsAttention.oversold.length" class="oversold-summary">
+            <span class="unmapped-label">Oversold:</span>
+            <span v-for="o in needsAttention.oversold" :key="o.ticket_type_id" class="oversold-chip">
+              <strong>{{ o.name }}</strong>
+              <template v-if="o.capacity != null"> · {{ o.sold }} of {{ o.capacity }}</template>
+              <em>{{ o.over_by }} over, across {{ o.orders }} order{{ o.orders === 1 ? '' : 's' }}</em>
+            </span>
+          </div>
 
           <div v-if="needsAttention.unmapped.length" class="unmapped-summary">
             <span class="unmapped-label">Unmapped:</span>
@@ -75,7 +86,7 @@
                 <th>Time</th>
                 <th>Order</th>
                 <th>Customer</th>
-                <th>Didn't match</th>
+                <th>Needs a look</th>
                 <th>Tickets issued</th>
                 <th></th>
               </tr>
@@ -86,10 +97,16 @@
                 <td>{{ row.order_name || ('#' + (row.order_number || row.shopify_order_id)) }}</td>
                 <td>{{ row.customer || '—' }}</td>
                 <td>
-                  <div v-for="(item, i) in row.unmatched_line_items" :key="i" class="unmatched-item">
+                  <div v-for="(item, i) in row.unmatched_line_items" :key="'u' + i" class="unmatched-item">
+                    <span class="tag tag-unmatched">no match</span>
                     <strong>{{ item.sku || 'no SKU' }}</strong>
                     <span v-if="item.title"> — {{ item.title }}</span>
                     <span v-if="item.quantity > 1" class="qty">×{{ item.quantity }}</span>
+                  </div>
+                  <div v-for="(w, i) in row.capacity_warnings" :key="'c' + i" class="unmatched-item">
+                    <span class="tag tag-capacity">over</span>
+                    <strong>{{ w.name }}</strong>
+                    <span> — {{ w.sold }} of {{ w.capacity }} sold, {{ w.requested }} more ({{ w.over_by }} over)</span>
                   </div>
                 </td>
                 <td>
@@ -343,7 +360,7 @@ export default {
     const selectedWebhookType = ref('');
 
     // Orders that produced no ticket for at least one line item.
-    const needsAttention = ref({ count: 0, orders: [], unmapped: [] });
+    const needsAttention = ref({ count: 0, orders: [], unmapped: [], oversold: [] });
     const retryingUnmatched = ref(new Set());
     
     // Available webhook types for manual selection
@@ -370,6 +387,7 @@ export default {
           count: response.data.count || 0,
           orders: response.data.orders || [],
           unmapped: response.data.unmapped || [],
+          oversold: response.data.oversold || [],
         };
       } catch (err) {
         console.error('Error fetching needs-attention orders:', err);
@@ -1271,6 +1289,21 @@ export default {
   display: inline-flex; gap: 6px; align-items: baseline;
 }
 .unmapped-chip em { color: #a08a68; font-style: normal; }
+
+.oversold-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
+.oversold-chip {
+  background: white; border: 1px solid #f6c5c5; border-radius: 12px;
+  padding: 4px 10px; font-size: 12px; color: #a32020;
+  display: inline-flex; gap: 6px; align-items: baseline;
+}
+.oversold-chip em { color: #c26b6b; font-style: normal; }
+
+.tag {
+  display: inline-block; font-size: 10px; font-weight: 700; text-transform: uppercase;
+  padding: 1px 6px; border-radius: 8px; margin-right: 6px; letter-spacing: 0.3px;
+}
+.tag-unmatched { background: #fff3e0; color: #8a5a00; }
+.tag-capacity { background: #fdecec; color: #a32020; }
 
 .attention-table { width: 100%; border-collapse: collapse; font-size: 13px; background: white; border-radius: 8px; overflow: hidden; }
 .attention-table th {

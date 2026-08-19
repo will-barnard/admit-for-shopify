@@ -482,14 +482,26 @@ async function runMigrations() {
         ) THEN
           ALTER TABLE webhook_logs ADD COLUMN unmatched_resolved_at TIMESTAMP;
         END IF;
+
+        -- A paid Shopify order is never refused for being over capacity - the
+        -- customer has already been charged. It is recorded here instead, and
+        -- surfaces in the same needs-attention list as unmatched line items.
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'webhook_logs' AND column_name = 'capacity_warnings'
+        ) THEN
+          ALTER TABLE webhook_logs ADD COLUMN capacity_warnings JSONB;
+        END IF;
       END $$;
     `);
 
     await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_webhook_logs_unmatched
+      CREATE INDEX IF NOT EXISTS idx_webhook_logs_needs_attention
         ON webhook_logs (shop_id, created_at DESC)
-        WHERE unmatched_line_items IS NOT NULL AND unmatched_resolved_at IS NULL
+        WHERE (unmatched_line_items IS NOT NULL OR capacity_warnings IS NOT NULL)
+          AND unmatched_resolved_at IS NULL
     `);
+    await db.query('DROP INDEX IF EXISTS idx_webhook_logs_unmatched');
     console.log('\u2713 webhook_logs.unmatched_line_items ensured');
 
     // ------------------------------------------------------------------

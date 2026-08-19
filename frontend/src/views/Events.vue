@@ -65,11 +65,18 @@
                 v-for="tt in (event.ticket_types || [])"
                 :key="tt.id"
                 class="type-chip"
-                :class="{ unmapped: !isMapped(tt), 'type-inactive': tt.active === false }"
+                :class="{
+                  unmapped: !isMapped(tt),
+                  'type-inactive': tt.active === false,
+                  'type-full': capacityState(tt) === 'full',
+                  'type-over': capacityState(tt) === 'over',
+                }"
                 :title="mappingLabel(tt)"
               >
                 <span class="type-name">{{ tt.name }}</span>
                 <span class="type-count">{{ tt.ticket_count || 0 }}<template v-if="tt.capacity">/{{ tt.capacity }}</template></span>
+                <span v-if="capacityState(tt) === 'over'" class="type-warn">oversold</span>
+                <span v-else-if="capacityState(tt) === 'full'" class="type-warn">full</span>
                 <span v-if="!isMapped(tt)" class="type-warn" title="No Shopify variant or SKU - orders will never match this type">not mapped</span>
                 <!-- Only when embedded: the store handle comes from App Bridge,
                      so a standalone page has no way to build this URL. -->
@@ -303,6 +310,17 @@ export default {
     });
 
     const isMapped = (t) => Boolean(t.shopify_variant_id || t.shopify_sku);
+
+    // Only meaningful once a capacity is set - an uncapped type is unlimited
+    // and should read as neither full nor oversold.
+    const capacityState = (t) => {
+      if (t.capacity === null || t.capacity === undefined || t.capacity === '') return null;
+      const sold = Number(t.ticket_count || 0);
+      const cap = Number(t.capacity);
+      if (sold > cap) return 'over';
+      if (sold >= cap) return 'full';
+      return null;
+    };
 
     // https://admin.shopify.com/store/<handle>/products/<id>. The handle is the
     // first label of the myshopify domain, which only App Bridge knows.
@@ -544,7 +562,7 @@ export default {
     return {
       authStore, events, loading, error, isChangePasswordOpen, showModal,
       editingEvent, saving, modalError, form, showArchived,
-      types, addType, removeType, isMapped, mappingLabel, removeTitle,
+      types, addType, removeType, isMapped, mappingLabel, removeTitle, capacityState,
       embedded, picking, pickFor, adminProductUrl,
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
       archiveEvent, unarchiveEvent, loadEvents,
@@ -597,6 +615,8 @@ export default {
 .type-chip .type-count { color: #5c68a8; }
 .type-chip.type-inactive { opacity: 0.55; }
 .type-chip.unmapped { background: #fff6e5; border-color: #ffe0a3; color: #8a5a00; }
+.type-chip.type-full { background: #eef7ee; border-color: #cfe6cf; color: #2e6b2e; }
+.type-chip.type-over { background: #fdecec; border-color: #f6c5c5; color: #a32020; }
 .type-warn { font-weight: 600; }
 .type-link { color: #3f4a8a; text-decoration: underline; font-size: 11px; }
 .type-link:hover { color: #202a5a; }

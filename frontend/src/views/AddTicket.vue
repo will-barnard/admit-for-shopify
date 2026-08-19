@@ -150,6 +150,21 @@
             {{ error }}
           </div>
 
+          <!-- Capacity is a guard rail, not a wall: staff comping someone in at
+               the door should be able to say so, once, deliberately. -->
+          <div v-if="overCapacity" class="capacity-block">
+            <p class="capacity-title">Over capacity</p>
+            <ul>
+              <li v-for="o in overCapacity" :key="o.ticket_type_id">
+                <strong>{{ o.name }}</strong> — {{ o.sold }} of {{ o.capacity }} sold,
+                {{ o.requested }} more requested ({{ o.over_by }} over)
+              </li>
+            </ul>
+            <button type="button" class="btn-override" :disabled="loading" @click="handleSubmit(true)">
+              Create anyway
+            </button>
+          </div>
+
           <div v-if="success" class="success-message">
             {{ success }}
           </div>
@@ -206,6 +221,7 @@ export default {
     const loading = ref(false);
     const error = ref('');
     const success = ref('');
+    const overCapacity = ref(null);
     const includeEmail = ref(true);
 
     const totalTickets = computed(() => {
@@ -267,10 +283,11 @@ export default {
       }
     };
 
-    const handleSubmit = async () => {
+    const handleSubmit = async (allowOverCapacity = false) => {
       loading.value = true;
       error.value = '';
       success.value = '';
+      if (!allowOverCapacity) overCapacity.value = null;
 
       try {
         const payload = {
@@ -295,7 +312,9 @@ export default {
           })
         };
 
-        const response = await axios.post('/api/tickets/create-order', payload);
+        const response = await axios.post('/api/tickets/create-order',
+          allowOverCapacity ? { ...payload, allowOverCapacity: true } : payload);
+        overCapacity.value = null;
         
         const ticketCount = response.data.ticketCount || totalTickets.value;
         if (response.data.warning) {
@@ -310,6 +329,9 @@ export default {
         }, 2000);
       } catch (err) {
         error.value = err.response?.data?.error || 'Failed to create order';
+        // 409 means nothing was created - the whole order is still pending a
+        // decision, so offer the override rather than leaving a dead end.
+        overCapacity.value = err.response?.status === 409 ? (err.response.data.overages || []) : null;
         console.error('Error creating order:', err);
       } finally {
         loading.value = false;
@@ -345,6 +367,7 @@ export default {
       loading,
       error,
       success,
+      overCapacity,
       includeEmail,
       totalTickets,
       typesFor,
@@ -466,6 +489,23 @@ input:focus, select:focus {
 .ticket-fields .form-group {
   margin-bottom: 0;
 }
+
+.capacity-block {
+  background: #fff6e5;
+  border: 1px solid #ffd9a0;
+  border-left: 5px solid #f0a02a;
+  border-radius: 8px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+}
+.capacity-title { margin: 0 0 8px; font-weight: 700; color: #8a5a00; }
+.capacity-block ul { margin: 0 0 12px; padding-left: 20px; color: #6b5330; font-size: 14px; }
+.btn-override {
+  padding: 8px 16px; border: 1px solid #f0a02a; background: white;
+  color: #8a5a00; border-radius: 6px; cursor: pointer; font-size: 14px;
+}
+.btn-override:hover { background: #fff0d6; }
+.btn-override:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .attendee-names {
   margin-top: 15px;

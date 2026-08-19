@@ -401,6 +401,121 @@ const q = (t, p) => db.query(t, p).then((r) => r.rows);
   check('  ...giving every ticket the line name, as before', family.length === 4, String(family.length));
 
   // -------------------------------------------------------------------------
+  console.log('\n5c. capacity');
+
+  // A tiny type so the arithmetic is easy to follow: capacity 2.
+  r = await api(`/api/events/${show.id}/ticket-types`, {
+    method: 'POST',
+    body: { name: 'Front Row', shopify_sku: 'CDS-FRONT', capacity: 2 },
+  });
+  const front = r.body;
+  check('a capped ticket type is created', r.status === 201 && front.capacity === 2, `${r.status} ${r.raw}`);
+
+  const bookFront = (qty, extra = {}) => api('/api/tickets/create-order', {
+    method: 'POST',
+    body: {
+      customerName: 'Buyer',
+      email: null,
+      tickets: [{ eventId: show.id, ticketTypeId: front.id, name: 'Buyer', quantity: qty }],
+      ...extra,
+    },
+  });
+
+  r = await bookFront(2);
+  check('filling it exactly is allowed', r.status === 201 || r.status === 200, `${r.status} ${r.raw}`);
+
+  r = await bookFront(1);
+  check('one more is refused with 409', r.status === 409, `${r.status} ${r.raw}`);
+  check('  ...saying which type and by how much',
+    /Front Row: 2 of 2 sold/.test(r.body?.error || ''), r.body?.error);
+  check('  ...and offering the override', r.body?.canOverride === true, JSON.stringify(r.body));
+  check('  ...machine-readably too',
+    r.body?.overages?.[0]?.ticket_type_id === front.id && r.body.overages[0].over_by === 1,
+    JSON.stringify(r.body?.overages));
+
+  let frontCount = await q(
+    "SELECT COUNT(*)::int c FROM tickets WHERE ticket_type_id = $1 AND shop_id = $2", [front.id, A]
+  );
+  check('the refused order created NOTHING', frontCount[0].c === 2, JSON.stringify(frontCount));
+
+  r = await bookFront(1, { allowOverCapacity: true });
+  check('an explicit override goes through', r.status === 201 || r.status === 200, `${r.status} ${r.raw}`);
+  frontCount = await q(
+    "SELECT COUNT(*)::int c FROM tickets WHERE ticket_type_id = $1 AND shop_id = $2", [front.id, A]
+  );
+  check('  ...and issues the ticket', frontCount[0].c === 3, JSON.stringify(frontCount));
+
+  // Voiding frees the place back up, exactly as the sold count everywhere else.
+  await db.query(
+    `UPDATE tickets SET status = 'refunded'
+      WHERE id IN (SELECT id FROM tickets WHERE ticket_type_id = $1 AND shop_id = $2 ORDER BY id LIMIT 2)`,
+    [front.id, A]
+  );
+  r = await bookFront(1);
+  check('a refund frees its place', r.status === 201 || r.status === 200, `${r.status} ${r.raw}`);
+
+  r = await api('/api/tickets/create-order', {
+    method: 'POST',
+    body: {
+      customerName: 'Uncapped',
+      email: null,
+      tickets: [{ eventId: show.id, ticketTypeId: adult.id, name: 'Uncapped', quantity: 40 }],
+    },
+  });
+  check('a type with no capacity set is unlimited', r.status === 201 || r.status === 200, `${r.status} ${r.raw}`);
+
+  // -------------------------------------------------------------------------
+  console.log('\n5d. a paid Shopify order is never refused for capacity');
+
+  await db.query(
+    "UPDATE event_ticket_types SET capacity = 1, shopify_variant_id = '333' WHERE id = $1", [child.id]
+  );
+  const childSold = (await q(
+    "SELECT COUNT(*)::int c FROM tickets WHERE ticket_type_id = $1 AND shop_id = $2 AND (status IS NULL OR status = 'valid')",
+    [child.id, A]
+  ))[0].c;
+
+  const oversellOrder = {
+    id: 7001,
+    name: '#7001',
+    customer: { first_name: 'Over', last_name: 'Sell', email: 'over@x.test' },
+    line_items: [{ id: 71, variant_id: 333, quantity: 3 }],
+  };
+  const oversellResult = await orders.processOrderCreate(oversellOrder, { source: 'test', shopId: A });
+
+  check('the order still produces every ticket', oversellResult.tickets.length === 3,
+    String(oversellResult.tickets.length));
+  check('  ...because the customer has already paid', oversellResult.outcome === 'created',
+    oversellResult.outcome);
+  check('the overage is reported back', (oversellResult.overages || []).length === 1,
+    JSON.stringify(oversellResult.overages));
+  check('  ...with the arithmetic',
+    oversellResult.overages[0].over_by === childSold + 3 - 1,
+    JSON.stringify(oversellResult.overages[0]));
+
+  r = await api('/api/webhooks/needs-attention');
+  const oversoldEntry = (r.body.oversold || []).find((o) => o.ticket_type_id === child.id);
+  check('it appears in needs-attention', Boolean(oversoldEntry), JSON.stringify(r.body.oversold));
+  check('  ...naming the ticket type', oversoldEntry?.name === 'Child Saturday', oversoldEntry?.name);
+  const oversellRow = (r.body.orders || []).find((o) => o.order_name === '#7001');
+  check('  ...and the order that caused it', Boolean(oversellRow), JSON.stringify(r.body.orders?.map((o) => o.order_name)));
+  check('  ...with an explanation on the row',
+    /Over capacity/.test(oversellRow?.error_message || ''), oversellRow?.error_message);
+
+  r = await api('/api/webhooks/stats/summary');
+  check('the needs-attention count includes it', Number(r.body.needs_attention) >= 1,
+    JSON.stringify(r.body.needs_attention));
+
+  r = await api(`/api/webhooks/${oversellRow.id}/resolve-unmatched`, { method: 'POST' });
+  check('a capacity-only entry can be dismissed', r.status === 200, `${r.status} ${r.raw}`);
+  r = await api('/api/webhooks/needs-attention');
+  check('  ...and then it is gone',
+    !(r.body.orders || []).some((o) => o.order_name === '#7001'),
+    JSON.stringify(r.body.orders?.map((o) => o.order_name)));
+
+  await db.query("UPDATE event_ticket_types SET capacity = NULL WHERE id = $1", [child.id]);
+
+  // -------------------------------------------------------------------------
   console.log('\n6. a type with issued tickets is protected');
 
   r = await api(`/api/events/${show.id}/ticket-types/${vip.id}`, { method: 'DELETE' });

@@ -17,6 +17,7 @@ const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
 const db = require('../config/database');
 const { sendTicketEmail, sendAdminNotification } = require('./email');
+const capacity = require('./capacity');
 
 const DAILY_EMAIL_LIMIT = 100;
 const VOIDABLE_FROM_STATUSES = ['valid'];
@@ -144,16 +145,17 @@ async function logWebhook({ shopId, orderId, payload, type, errorMessage = null,
   }
 }
 
-async function markWebhookProcessed(webhookLogId, { shopId, ticketsCreated = 0, errorMessage = null, unmatched = null } = {}) {
+async function markWebhookProcessed(webhookLogId, { shopId, ticketsCreated = 0, errorMessage = null, unmatched = null, overages = null } = {}) {
   if (!webhookLogId) return;
   try {
     await db.query(
       `UPDATE webhook_logs
           SET processed = TRUE, processed_at = NOW(), tickets_created = $1, error_message = $2,
-              unmatched_line_items = $5
+              unmatched_line_items = $5, capacity_warnings = $6
         WHERE id = $3 AND shop_id = $4`,
       [ticketsCreated, errorMessage, webhookLogId, shopId,
-       unmatched && unmatched.length > 0 ? JSON.stringify(unmatched) : null]
+       unmatched && unmatched.length > 0 ? JSON.stringify(unmatched) : null,
+       overages && overages.length > 0 ? JSON.stringify(overages) : null]
     );
   } catch (error) {
     console.error('Failed to update webhook log:', error);
@@ -240,7 +242,25 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
       }
 
       if (matched.length === 0) {
-        return { duplicate: false, tickets: [], unmatched };
+        return { duplicate: false, tickets: [], unmatched, overages: [] };
+      }
+
+      // A paid order is never refused for being over capacity - the customer
+      // has already been charged, and declining to issue the ticket turns an
+      // inventory mistake into a support problem. Shopify's own inventory is
+      // what should have stopped the sale, so an overage here means the two
+      // systems disagree. Measured BEFORE inserting, so it reads as "this order
+      // took you past the limit" rather than "you are over".
+      const overages = await capacity.findOverages(
+        shopId,
+        matched.map(({ lineItem, ticketType }) => ({
+          ticketTypeId: ticketType.id,
+          quantity: lineItem.quantity || 1,
+        })),
+        client
+      );
+      if (overages.length > 0) {
+        console.warn(`Order ${orderId} exceeds capacity: ${capacity.describeOverage(overages)}`);
       }
 
       const rows = [];
@@ -263,7 +283,7 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
           });
         }
       }
-      return { duplicate: false, tickets: rows, unmatched };
+      return { duplicate: false, tickets: rows, unmatched, overages };
     });
   } catch (error) {
     console.error('Error creating tickets for order:', error);
@@ -294,7 +314,7 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
       console.warn(`Order ${orderId} matched no ticket types. Unmatched:`, unmatched);
     }
     await markWebhookProcessed(logId, { shopId, errorMessage: detail, unmatched });
-    return { outcome: 'no_ticket_items', tickets: [], unmatched, webhookLogId: logId };
+    return { outcome: 'no_ticket_items', tickets: [], unmatched, overages: [], webhookLogId: logId };
   }
 
   // QR generation and email happen outside the transaction - they are slow and
@@ -313,19 +333,28 @@ async function processOrderCreate(payload, { source = 'webhook', webhookLogId = 
     sendType: source === 'retry' ? 'shopify_order_retry' : 'shopify_order',
   });
 
+  const overages = created.overages || [];
+
+  const notes = [];
+  // A partial match still deserves attention: some line items produced
+  // tickets and others silently did not.
+  if (unmatched.length > 0) {
+    notes.push(`Partially matched. Unmatched: ${unmatched.map((u) => u.sku || u.variant_id).join(', ')}`);
+  }
+  if (overages.length > 0) {
+    notes.push(`Over capacity. ${capacity.describeOverage(overages)}`);
+  }
+
   await markWebhookProcessed(logId, {
     shopId,
     ticketsCreated: tickets.length,
     unmatched,
-    // A partial match still deserves attention: some line items produced
-    // tickets and others silently did not.
-    errorMessage: unmatched.length > 0
-      ? `Partially matched. Unmatched: ${unmatched.map((u) => u.sku || u.variant_id).join(', ')}`
-      : null,
+    overages,
+    errorMessage: notes.length > 0 ? notes.join(' ') : null,
   });
   console.log(`Created ${tickets.length} ticket(s) from order ${orderId}`);
 
-  return { outcome: 'created', tickets, email, unmatched, webhookLogId: logId };
+  return { outcome: 'created', tickets, email, unmatched, overages, webhookLogId: logId };
 }
 
 /**

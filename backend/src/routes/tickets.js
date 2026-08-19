@@ -3,6 +3,7 @@ const { body, validationResult } = require('express-validator');
 const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
 const db = require('../config/database');
+const capacity = require('../services/capacity');
 const authMiddleware = require('../middleware/auth');
 const superAdminMiddleware = require('../middleware/superadmin');
 const checkLockdown = require('../middleware/lockdown');
@@ -169,7 +170,9 @@ router.post('/create-order',
       const { customerName, email, tickets: ticketItems } = req.body;
       const customerEmail = email || null;
 
-      // Validate all events exist
+      // Validate all events exist, and settle which ticket type each line is
+      // for. Resolving it here rather than inside the INSERT means the capacity
+      // check below knows what it is counting against.
       for (const ticketItem of ticketItems) {
         const eventResult = await db.query(
           'SELECT id, name FROM events WHERE id = $1 AND shop_id = $2',
@@ -192,6 +195,15 @@ router.post('/create-order',
               error: 'Ticket type ' + ticketItem.ticketTypeId + ' does not belong to event ' + ticketItem.eventId,
             });
           }
+          ticketItem.resolvedTypeId = Number(ticketItem.ticketTypeId);
+        } else {
+          const fallback = await db.query(
+            `SELECT id FROM event_ticket_types
+              WHERE event_id = $1 AND shop_id = $2 AND active = true
+              ORDER BY sort_order, id LIMIT 1`,
+            [ticketItem.eventId, req.shopId]
+          );
+          ticketItem.resolvedTypeId = fallback.rows[0]?.id ?? null;
         }
       }
 
@@ -212,41 +224,59 @@ router.post('/create-order',
       const eventMap = {};
       eventsResult.rows.forEach(e => { eventMap[e.id] = e.name; });
 
-      for (const ticketItem of ticketItems) {
-        const { eventId, name, quantity } = ticketItem;
-        const ticketQuantity = quantity || 1;
+      // Capacity and the inserts share one transaction, holding a lock per
+      // ticket type, so two people creating the last few tickets at the same
+      // moment cannot both pass the check. QR generation stays outside it -
+      // there is no reason to hold a database connection while doing that.
+      let overages = [];
+      const inserted = await db.withTransaction(async (client) => {
+        await capacity.lockTicketTypes(client, req.shopId, ticketItems.map((t) => t.resolvedTypeId));
 
-        // One name per LINE was the only option, so quantity 5 produced five
-        // tickets all called the same thing. Fine for a family; wrong for a
-        // company buying five passes, where the door needs to know who is who.
-        // attendeeNames is optional and positional - a blank entry, or none at
-        // all, falls back to the line's name, so the simple case is unchanged.
-        const attendeeNames = Array.isArray(ticketItem.attendeeNames) ? ticketItem.attendeeNames : [];
-
-        for (let i = 0; i < ticketQuantity; i++) {
-          const attendeeName = String(attendeeNames[i] ?? '').trim() || name;
-          const ticketUuid = uuidv4();
-          const verifyUrl = `${process.env.FRONTEND_URL}/verify/${ticketUuid}`;
-
-          const result = await db.query(
-            `INSERT INTO tickets (shop_id, event_id, ticket_type_id, name, email, uuid, shopify_order_id)
-             VALUES ($1, $2,
-               COALESCE($3, (SELECT id FROM event_ticket_types
-                              WHERE event_id = $2 AND shop_id = $1 AND active = true
-                              ORDER BY sort_order, id LIMIT 1)),
-               $4, $5, $6, $7) RETURNING *`,
-            [req.shopId, eventId, ticketItem.ticketTypeId || null, attendeeName, customerEmail, ticketUuid, manualOrderId]
-          );
-          const ticket = result.rows[0];
-          const qrCodeDataUrl = await QRCode.toDataURL(verifyUrl);
-          
-          createdTickets.push({
-            ...ticket,
-            event_name: eventMap[eventId],
-            qrCodeDataUrl,
-            verifyUrl
-          });
+        overages = await capacity.findOverages(
+          req.shopId,
+          ticketItems.map((t) => ({ ticketTypeId: t.resolvedTypeId, quantity: t.quantity || 1 })),
+          client
+        );
+        // Staff can still comp someone in at the door - but they have to say so.
+        if (overages.length > 0 && req.body.allowOverCapacity !== true) {
+          const err = new Error('over_capacity');
+          err.overages = overages;
+          throw err;
         }
+
+        const rows = [];
+        for (const ticketItem of ticketItems) {
+          const { eventId, name, quantity } = ticketItem;
+          const ticketQuantity = quantity || 1;
+
+          // One name per LINE was the only option, so quantity 5 produced five
+          // tickets all called the same thing. Fine for a family; wrong for a
+          // company buying five passes, where the door needs to know who is who.
+          // attendeeNames is optional and positional - a blank entry, or none at
+          // all, falls back to the line's name, so the simple case is unchanged.
+          const attendeeNames = Array.isArray(ticketItem.attendeeNames) ? ticketItem.attendeeNames : [];
+
+          for (let i = 0; i < ticketQuantity; i++) {
+            const attendeeName = String(attendeeNames[i] ?? '').trim() || name;
+            const result = await client.query(
+              `INSERT INTO tickets (shop_id, event_id, ticket_type_id, name, email, uuid, shopify_order_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+              [req.shopId, eventId, ticketItem.resolvedTypeId, attendeeName, customerEmail, uuidv4(), manualOrderId]
+            );
+            rows.push({ ticket: result.rows[0], eventId });
+          }
+        }
+        return rows;
+      });
+
+      for (const { ticket, eventId } of inserted) {
+        const verifyUrl = `${process.env.FRONTEND_URL}/verify/${ticket.uuid}`;
+        createdTickets.push({
+          ...ticket,
+          event_name: eventMap[eventId],
+          qrCodeDataUrl: await QRCode.toDataURL(verifyUrl),
+          verifyUrl,
+        });
       }
 
       let emailSent = false;
@@ -330,6 +360,14 @@ router.post('/create-order',
         warning: emailError ? 'Email delivery failed' : null
       });
     } catch (error) {
+      if (error.message === 'over_capacity') {
+        return res.status(409).json({
+          error: `That would exceed capacity. ${capacity.describeOverage(error.overages)}.`,
+          overages: error.overages,
+          // The client may retry with allowOverCapacity: true to go ahead anyway.
+          canOverride: true,
+        });
+      }
       console.error('Error creating order:', error);
       res.status(500).json({ error: 'Server error' });
     }
