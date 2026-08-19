@@ -71,6 +71,16 @@
                 <span class="type-name">{{ tt.name }}</span>
                 <span class="type-count">{{ tt.ticket_count || 0 }}<template v-if="tt.capacity">/{{ tt.capacity }}</template></span>
                 <span v-if="!isMapped(tt)" class="type-warn" title="No Shopify variant or SKU - orders will never match this type">not mapped</span>
+                <!-- Only when embedded: the store handle comes from App Bridge,
+                     so a standalone page has no way to build this URL. -->
+                <a
+                  v-if="adminProductUrl(tt)"
+                  :href="adminProductUrl(tt)"
+                  target="_top"
+                  class="type-link"
+                  title="Open this product in the Shopify admin"
+                  @click.stop
+                >open in Shopify</a>
               </span>
               <span v-if="!(event.ticket_types || []).length" class="type-chip unmapped">no ticket types</span>
             </div>
@@ -129,8 +139,13 @@
               <input v-model="form.event_date" type="date" />
             </div>
             <div class="form-group">
-              <label>Event Time</label>
-              <input v-model="form.event_time" type="text" placeholder="e.g. 10:00 AM - 6:00 PM" />
+              <label>Start Time</label>
+              <!-- A real time input, because the column behind this is a
+                   Postgres `time`. The old free-text field hinted at a RANGE
+                   ("10:00 AM - 6:00 PM"), which the database rejected and the
+                   API reported as a bare 500. -->
+              <input v-model="form.event_time" type="time" />
+              <p class="hint">Doors/finish times go in the description for now.</p>
             </div>
           </div>
           <div class="form-group">
@@ -233,7 +248,7 @@ import { useAuthStore } from '@/stores/auth';
 import axios from 'axios';
 import ChangePasswordModal from '@/components/ChangePasswordModal.vue';
 import PageHeader from '@/components/PageHeader.vue';
-import { isEmbedded, pickVariant } from '@/shopify';
+import { isEmbedded, pickVariant, shopDomain } from '@/shopify';
 
 let rowKey = 0;
 
@@ -289,6 +304,17 @@ export default {
 
     const isMapped = (t) => Boolean(t.shopify_variant_id || t.shopify_sku);
 
+    // https://admin.shopify.com/store/<handle>/products/<id>. The handle is the
+    // first label of the myshopify domain, which only App Bridge knows.
+    const storeHandle = () => (shopDomain() || '').split('.')[0] || null;
+
+    const adminProductUrl = (t) => {
+      const handle = embedded.value ? storeHandle() : null;
+      if (!handle || !t.shopify_product_id) return null;
+      const base = `https://admin.shopify.com/store/${handle}/products/${t.shopify_product_id}`;
+      return t.shopify_variant_id ? `${base}/variants/${t.shopify_variant_id}` : base;
+    };
+
     const mappingLabel = (t) => {
       if (t.shopify_variant_id) return `Variant ${t.shopify_variant_id}`;
       if (t.shopify_sku) return `SKU ${t.shopify_sku}`;
@@ -338,7 +364,7 @@ export default {
       form.name = event.name;
       form.description = event.description || '';
       form.event_date = event.event_date ? event.event_date.split('T')[0] : '';
-      form.event_time = event.event_time || '';
+      form.event_time = (event.event_time || '').slice(0, 5);
       form.location = event.location || '';
       form.active = event.active;
       showModal.value = true;
@@ -519,7 +545,7 @@ export default {
       authStore, events, loading, error, isChangePasswordOpen, showModal,
       editingEvent, saving, modalError, form, showArchived,
       types, addType, removeType, isMapped, mappingLabel, removeTitle,
-      embedded, picking, pickFor,
+      embedded, picking, pickFor, adminProductUrl,
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
       archiveEvent, unarchiveEvent, loadEvents,
       formatDate, showChangePassword, handleLogout
@@ -572,6 +598,8 @@ export default {
 .type-chip.type-inactive { opacity: 0.55; }
 .type-chip.unmapped { background: #fff6e5; border-color: #ffe0a3; color: #8a5a00; }
 .type-warn { font-weight: 600; }
+.type-link { color: #3f4a8a; text-decoration: underline; font-size: 11px; }
+.type-link:hover { color: #202a5a; }
 
 .event-stats { display: flex; gap: 16px; font-size: 13px; }
 .event-stats .stat { background: #f0f0f0; padding: 4px 10px; border-radius: 12px; }
@@ -601,7 +629,7 @@ export default {
 
 .form-group { margin-bottom: 18px; }
 .form-group label { display: block; margin-bottom: 6px; font-weight: 500; color: #333; font-size: 14px; }
-.form-group input[type="text"], .form-group input[type="date"], .form-group input[type="number"], .form-group textarea {
+.form-group input[type="text"], .form-group input[type="date"], .form-group input[type="time"], .form-group input[type="number"], .form-group textarea {
   width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; box-sizing: border-box;
 }
 .form-group textarea { resize: vertical; }

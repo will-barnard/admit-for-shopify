@@ -109,6 +109,44 @@ const q = (t, p) => db.query(t, p).then((r) => r.rows);
   check('  ...with a reason that says why', /at least one/i.test(r.body?.error || ''), r.body?.error);
 
   // -------------------------------------------------------------------------
+  console.log('\n1b. event time is a clock time, and says so when it is not');
+
+  // events.event_time is a Postgres `time`. The form used to hint
+  // "e.g. 10:00 AM - 6:00 PM", which the column rejects - and the route turned
+  // that parse error into a bare 500, so following the app's own placeholder
+  // produced an unexplained failure.
+  r = await api('/api/events', {
+    method: 'POST',
+    body: { name: 'Ranged', event_date: '2026-10-02', event_time: '10:00 AM - 6:00 PM' },
+  });
+  check('a time RANGE is refused with 400, not a 500', r.status === 400, `${r.status} ${r.raw}`);
+  check('  ...explaining what to do instead', /single clock time/i.test(r.body?.error || ''), r.body?.error);
+
+  for (const good of ['19:00', '09:30', '7:00 PM', '11:15:00']) {
+    r = await api('/api/events', {
+      method: 'POST',
+      body: { name: `Timed ${good}`, event_date: '2026-10-03', event_time: good },
+    });
+    check(`"${good}" is accepted`, r.status === 201, `${r.status} ${r.raw}`);
+  }
+
+  r = await api('/api/events', {
+    method: 'POST', body: { name: 'No time', event_date: '2026-10-04', event_time: '' },
+  });
+  check('an empty time is still fine', r.status === 201, `${r.status} ${r.raw}`);
+
+  r = await api('/api/events', {
+    method: 'POST', body: { name: 'Nonsense', event_date: '2026-10-05', event_time: 'whenever' },
+  });
+  check('gibberish is refused too', r.status === 400, `${r.status}`);
+
+  r = await api(`/api/events/${simple.id}`, {
+    method: 'PUT',
+    body: { name: 'Open Mic', event_date: '2026-10-01', event_time: '10:00 AM - 6:00 PM' },
+  });
+  check('editing an event checks the time as well', r.status === 400, `${r.status} ${r.raw}`);
+
+  // -------------------------------------------------------------------------
   console.log('\n2. an event with several ticket types');
 
   r = await api('/api/events', {
@@ -138,7 +176,9 @@ const q = (t, p) => db.query(t, p).then((r) => r.rows);
   const listed = r.body.find((e) => e.id === show.id);
   check('the list endpoint embeds ticket types', (listed.ticket_types || []).length === 3,
     JSON.stringify(listed.ticket_types?.length));
-  check('one row per SHOW, not one per ticket type', r.body.length === 2, String(r.body.length));
+  check('one row per SHOW, not one per ticket type',
+    r.body.filter((e) => e.name === 'Chicago Drum Show').length === 1,
+    JSON.stringify(r.body.map((e) => e.name)));
 
   // Uniqueness is per shop, and only where a value is present.
   r = await api(`/api/events/${show.id}/ticket-types`, {

@@ -48,4 +48,18 @@ const authRouteLimiter = rateLimit({
   message: { error: 'Too many requests. Try again shortly.' },
 });
 
-module.exports = { loginAttemptLimiter, authRouteLimiter };
+/**
+ * The public ticket lookup. A ticket UUID is a v4 - 122 bits - so guessing one
+ * is not a realistic attack, but the endpoint is unauthenticated and hits the
+ * database, so it should not be free to hammer. Generous: a family opening
+ * five tickets from one phone must not be blocked.
+ */
+const publicTicketLimiter = rateLimit({
+  windowMs: FIFTEEN_MINUTES,
+  limit: 120,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Try again shortly.' },
+});
+
+module.exports = { loginAttemptLimiter, authRouteLimiter, publicTicketLimiter };

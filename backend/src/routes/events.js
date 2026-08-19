@@ -9,6 +9,28 @@ const requireRole = require('../middleware/require-role');
 // previously create, edit, archive and delete events and their ticket types.
 const canManageEvents = requireRole('admin', 'superadmin');
 
+/**
+ * events.event_time is a Postgres `time` column, but the form used to be free
+ * text hinting "e.g. 10:00 AM - 6:00 PM". Typing exactly that raised a
+ * datetime parse error, which the catch below turned into a bare
+ * `{"error":"Server error"}` - so following the app's own placeholder produced
+ * an unexplained 500.
+ *
+ * A single clock time is what the column can hold. A range needs separate
+ * start/end columns, which is a schema change worth doing on its own; until
+ * then, say so rather than failing opaquely.
+ */
+const TIME_PATTERN = /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$|^(0?[1-9]|1[0-2]):[0-5]\d\s*([AaPp][Mm])$/;
+
+function invalidTime(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (TIME_PATTERN.test(String(value).trim())) return null;
+  return {
+    error: 'Event time must be a single clock time, such as 19:00 or 7:00 PM. '
+      + 'For a range like "10:00 AM - 6:00 PM", put it in the description for now.',
+  };
+}
+
 const router = express.Router();
 
 // Get all events (protected)
@@ -86,6 +108,9 @@ router.post('/',
 
       const { name, description, event_date, event_time, location, sku } = req.body;
 
+      const timeProblem = invalidTime(event_time);
+      if (timeProblem) return res.status(400).json(timeProblem);
+
       const created = await db.withTransaction(async (client) => {
         const eventResult = await client.query(
           `INSERT INTO events (shop_id, name, description, event_date, event_time, location)
@@ -139,6 +164,9 @@ router.put('/:id',
 
       const { id } = req.params;
       const { name, description, event_date, event_time, location, active } = req.body;
+
+      const timeProblem = invalidTime(event_time);
+      if (timeProblem) return res.status(400).json(timeProblem);
 
       // events.sku is no longer written - the Shopify mapping lives on
       // event_ticket_types. The column is retained for historical rows.

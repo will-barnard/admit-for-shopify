@@ -110,6 +110,7 @@ async function api(path, { method = 'GET', body, token, headers = {} } = {}) {
   app.use('/api', require('../src/middleware/shop-context'));
   app.use('/api/events', require('../src/routes/events'));
   app.use('/api/settings', require('../src/routes/settings'));
+  app.use('/api/verify', require('../src/routes/verify'));
   const server = await new Promise((r) => { const s = app.listen(process.env.PORT, () => r(s)); });
 
   // -------------------------------------------------------------------------
@@ -295,6 +296,79 @@ async function api(path, { method = 'GET', body, token, headers = {} } = {}) {
 
   up = await postLogo('logo.png', 'image/png', png, legacyToken('verifier', 3));
   check('a verifier cannot upload a logo at all', up.status === 403, `${up.status}`);
+
+  // -------------------------------------------------------------------------
+  console.log('\n7. the customer can open their own ticket');
+
+  // A ticket belonging to a shop that is NOT DEFAULT_SHOP_DOMAIN, because the
+  // public lookup has no session to derive a tenant from and must not quietly
+  // resolve everything against the default shop.
+  const otherShop = (await q(
+    "INSERT INTO shops (domain) VALUES ('elsewhere.myshopify.com') RETURNING id"
+  ))[0].id;
+  await db.query("INSERT INTO settings (shop_id, org_name) VALUES ($1,'Elsewhere')", [otherShop]);
+  const otherEvent = (await q(
+    "INSERT INTO events (shop_id, name, event_date, event_time, location) VALUES ($1,'Far Fest','2026-12-05','19:00','The Barn') RETURNING id",
+    [otherShop]
+  ))[0].id;
+  const otherType = (await q(
+    "INSERT INTO event_ticket_types (shop_id, event_id, name) VALUES ($1,$2,'VIP') RETURNING id", [otherShop, otherEvent]
+  ))[0].id;
+  await db.query(
+    `INSERT INTO tickets (shop_id, event_id, ticket_type_id, name, email, uuid, shopify_order_id)
+     VALUES ($1,$2,$3,'Pat Holder','pat@x.test','ticket-uuid-public','ord-secret-9')`,
+    [otherShop, otherEvent, otherType]
+  );
+
+  r = await api('/api/verify/public/ticket-uuid-public');
+  check('a ticket link opens with NO token at all', r.status === 200, `${r.status} ${r.raw}`);
+  check('  ...for a shop that is not the default tenant', r.body.eventName === 'Far Fest', r.body.eventName);
+  check('  ...showing the holder their own name', r.body.name === 'Pat Holder', r.body.name);
+  check('  ...and the ticket type', r.body.ticketType === 'VIP', r.body.ticketType);
+  check('  ...and where to turn up', r.body.location === 'The Barn' && String(r.body.eventTime).startsWith('19:00'),
+    JSON.stringify({ location: r.body.location, time: r.body.eventTime }));
+  check('  ...reported valid', r.body.status === 'valid', r.body.status);
+
+  const leaked = JSON.stringify(r.body);
+  check('the email address is NOT returned', !leaked.includes('pat@x.test'), leaked);
+  check('the order id is NOT returned', !leaked.includes('ord-secret-9'), leaked);
+  check('internal ids are NOT returned', !/"(id|shop_id|ticket_type_id|event_id)"/.test(leaked), leaked);
+
+  const scansAfterView = await q('SELECT id FROM ticket_scans WHERE shop_id = $1', [otherShop]);
+  check('opening the link does NOT check the ticket in', scansAfterView.length === 0,
+    JSON.stringify(scansAfterView));
+
+  // Ten more views, still no scan - this is the case that used to burn a
+  // ticket whenever a signed-in admin clicked a link.
+  for (let i = 0; i < 10; i += 1) await api('/api/verify/public/ticket-uuid-public');
+  check('  ...no matter how many times it is opened',
+    (await q('SELECT id FROM ticket_scans WHERE shop_id = $1', [otherShop])).length === 0);
+
+  r = await api('/api/verify/public/no-such-ticket');
+  check('an unknown uuid is a plain 404', r.status === 404 && r.body.status === 'invalid',
+    `${r.status} ${r.raw}`);
+
+  // The staff endpoint is unchanged: still authenticated, still checks in.
+  r = await api('/api/verify/ticket-uuid-public');
+  check('the staff endpoint still refuses an anonymous request', r.status === 401, `${r.status}`);
+
+  await db.query("UPDATE tickets SET status = 'refunded' WHERE uuid = 'ticket-uuid-public'");
+  r = await api('/api/verify/public/ticket-uuid-public');
+  check('a refunded ticket says so', r.body.status === 'refunded', JSON.stringify(r.body.status));
+
+  await db.query("UPDATE tickets SET status = 'valid' WHERE uuid = 'ticket-uuid-public'");
+  await db.query(
+    `INSERT INTO ticket_scans (shop_id, ticket_id, scan_date, scanned_by_user_id)
+     SELECT $1, id, '2026-12-05', 1 FROM tickets WHERE uuid = 'ticket-uuid-public'`,
+    [otherShop]
+  );
+  r = await api('/api/verify/public/ticket-uuid-public');
+  check('a checked-in ticket says so, with when', r.body.status === 'already_scanned' && r.body.scannedOn,
+    JSON.stringify({ status: r.body.status, scannedOn: r.body.scannedOn }));
+
+  await db.query('UPDATE events SET archived = true WHERE id = $1', [otherEvent]);
+  r = await api('/api/verify/public/ticket-uuid-public');
+  check('an archived event takes priority in the message', r.body.status === 'archived', r.body.status);
 
   console.log(`\n${pass} passed, ${fail} failed`);
   server.close();

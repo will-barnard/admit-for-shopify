@@ -12,15 +12,17 @@
           <path fill="none" d="M14.1 27.2l7.1 7.2 16.7-16.8"/>
         </svg>
       </div>
-      <h1>Access Granted!</h1>
-      <h2>Welcome</h2>
+      <h1>Valid Ticket</h1>
+      <h2 v-if="ticketData.orgName">{{ ticketData.orgName }}</h2>
       <div class="ticket-info">
         <p><strong>Event:</strong> {{ ticketData.eventName }}</p>
+        <p v-if="ticketData.ticketType"><strong>Ticket:</strong> {{ ticketData.ticketType }}</p>
         <p><strong>Name:</strong> {{ ticketData.name }}</p>
-        <p v-if="ticketData.eventDate"><strong>Date:</strong> {{ ticketData.eventDate }}</p>
+        <p v-if="ticketData.eventDate"><strong>Date:</strong> {{ formattedDate }}</p>
+        <p v-if="ticketData.eventTime"><strong>Time:</strong> {{ ticketData.eventTime }}</p>
         <p v-if="ticketData.location"><strong>Location:</strong> {{ ticketData.location }}</p>
       </div>
-      <p class="message">This ticket has been marked as used.</p>
+      <p class="message">Present the QR code from your email at the entrance and a staff member will check you in.</p>
     </div>
 
     <div v-else-if="status === 'already_scanned'" class="verify-card warning">
@@ -29,9 +31,10 @@
       <div class="ticket-info">
         <p><strong>Name:</strong> {{ ticketData.name }}</p>
         <p v-if="ticketData.eventName"><strong>Event:</strong> {{ ticketData.eventName }}</p>
-        <p v-if="scannedOn"><strong>Scanned:</strong> {{ scannedOn }}</p>
+        <p v-if="ticketData.ticketType"><strong>Ticket:</strong> {{ ticketData.ticketType }}</p>
+        <p v-if="scannedOn"><strong>Checked in:</strong> {{ scannedOn }}</p>
       </div>
-      <p class="message">This ticket has already been scanned and used.</p>
+      <p class="message">This ticket has already been checked in. If that wasn't you, speak to event staff.</p>
     </div>
 
     <div v-else-if="status === 'archived'" class="verify-card warning">
@@ -61,10 +64,10 @@
 
     <div v-else-if="status === 'auth_required'" class="verify-card warning">
       <div class="icon">!</div>
-      <h1>Staff Sign-in Required</h1>
+      <h1>Ticket Unavailable</h1>
       <p class="message">
-        This ticket can only be checked in by event staff. If you're an attendee,
-        please present this QR code at the entrance and a staff member will scan it.
+        This ticket could not be displayed right now. Present the QR code from your
+        email at the entrance and a staff member will scan it.
       </p>
     </div>
 
@@ -127,11 +130,22 @@ export default {
       }
     };
 
+    const formattedDate = computed(() => {
+      const raw = ticketData.value?.eventDate;
+      if (!raw) return '';
+      const parsed = new Date(raw);
+      return Number.isNaN(parsed.getTime()) ? raw : parsed.toLocaleDateString();
+    });
+
     const verifyTicket = async () => {
       const uuid = route.params.uuid;
 
       try {
-        const response = await axios.get(`/api/verify/${uuid}`);
+        // The PUBLIC lookup, deliberately. `/api/verify/:uuid` is the
+        // scanner's endpoint and records a check-in - an admin who happened to
+        // be signed in and opened a ticket link would have burnt the ticket.
+        // This page only ever shows what the ticket is.
+        const response = await axios.get(`/api/verify/public/${uuid}`);
         status.value = response.data.status;
         applyTicketData(response.data);
       } catch (error) {
@@ -143,10 +157,9 @@ export default {
           // refunded, cancelled, chargeback, invalid) in the error body.
           status.value = body.status;
           applyTicketData(body);
-        } else if (httpStatus === 401) {
-          // GET /api/verify/:uuid requires authentication, but this page is a
-          // public route - it is the QR code target. An attendee opening their
-          // own ticket link lands here.
+        } else if (httpStatus === 401 || httpStatus === 429) {
+          // Should not happen on the public route - kept so a misconfigured
+          // deploy degrades to a sentence rather than a blank error card.
           status.value = 'auth_required';
         } else if (httpStatus === 423) {
           status.value = 'locked';
@@ -169,6 +182,7 @@ export default {
       voidedStatuses,
       scannedOn,
       ticketData,
+      formattedDate,
     };
   },
 };
