@@ -103,7 +103,36 @@
                     min="1"
                     max="50"
                     required
+                    @change="syncAttendeeNames(ticket)"
                   />
+                </div>
+              </div>
+
+              <!-- Quantity above 1 used to mean N tickets all carrying the same
+                   name. Fine for a family, wrong for a company buying passes -
+                   so offer the choice rather than assuming either. -->
+              <div v-if="ticket.quantity > 1" class="attendee-names">
+                <label class="checkbox-wrapper attendee-toggle">
+                  <input
+                    type="checkbox"
+                    :checked="ticket.nameEach"
+                    @change="toggleNameEach(ticket, $event.target.checked)"
+                  />
+                  <span>Name each attendee separately</span>
+                </label>
+
+                <div v-if="ticket.nameEach" class="attendee-grid">
+                  <div v-for="n in ticket.quantity" :key="n" class="form-group">
+                    <label>Attendee {{ n }}</label>
+                    <input
+                      v-model="ticket.attendeeNames[n - 1]"
+                      type="text"
+                      :placeholder="ticket.name || 'Attendee name'"
+                    />
+                  </div>
+                  <p class="hint attendee-hint">
+                    Blank falls back to &ldquo;{{ ticket.name || 'the name above' }}&rdquo;.
+                  </p>
                 </div>
               </div>
             </div>
@@ -169,6 +198,8 @@ export default {
         ticketTypeId: '',
         name: '',
         quantity: 1,
+        nameEach: false,
+        attendeeNames: [],
       }]
     });
 
@@ -204,12 +235,29 @@ export default {
       ticket.ticketTypeId = types.length === 1 ? types[0].id : '';
     };
 
+    // Keep the per-attendee inputs the same length as the quantity, without
+    // discarding names already typed when the quantity goes up.
+    const syncAttendeeNames = (ticket) => {
+      const wanted = Math.max(0, Number(ticket.quantity) || 0);
+      const names = ticket.attendeeNames || (ticket.attendeeNames = []);
+      while (names.length < wanted) names.push('');
+      names.length = wanted;
+      if (wanted <= 1) ticket.nameEach = false;
+    };
+
+    const toggleNameEach = (ticket, on) => {
+      ticket.nameEach = on;
+      if (on) syncAttendeeNames(ticket);
+    };
+
     const addTicket = () => {
       orderData.tickets.push({
         eventId: '',
         ticketTypeId: '',
         name: '',
         quantity: 1,
+        nameEach: false,
+        attendeeNames: [],
       });
     };
 
@@ -237,7 +285,12 @@ export default {
               eventId: ticket.eventId,
               ticketTypeId: typeId || null,
               name: ticket.name,
-              quantity: ticket.quantity
+              quantity: ticket.quantity,
+              // Omitted entirely unless the operator asked for it, so the
+              // simple case sends exactly what it always did.
+              ...(ticket.nameEach && ticket.quantity > 1
+                ? { attendeeNames: (ticket.attendeeNames || []).slice(0, ticket.quantity) }
+                : {}),
             };
           })
         };
@@ -271,6 +324,8 @@ export default {
         ticketTypeId: '',
         name: '',
         quantity: 1,
+        nameEach: false,
+        attendeeNames: [],
       }];
       error.value = '';
       success.value = '';
@@ -294,6 +349,8 @@ export default {
       totalTickets,
       typesFor,
       onEventChange,
+      syncAttendeeNames,
+      toggleNameEach,
       handleSubmit,
       addTicket,
       removeTicket,
@@ -409,6 +466,21 @@ input:focus, select:focus {
 .ticket-fields .form-group {
   margin-bottom: 0;
 }
+
+.attendee-names {
+  margin-top: 15px;
+  padding-top: 15px;
+  border-top: 1px dashed #ddd;
+}
+.attendee-toggle { font-size: 14px; color: #444; }
+.attendee-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+.attendee-grid .form-group { margin-bottom: 0; }
+.attendee-hint { grid-column: 1 / -1; margin: 0; }
 
 .type-fixed .fixed-value {
   margin: 0;

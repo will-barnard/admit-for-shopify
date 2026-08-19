@@ -351,6 +351,56 @@ const q = (t, p) => db.query(t, p).then((r) => r.rows);
   check('a ticket type from another SHOP is rejected', r.status === 400, `${r.status} ${r.raw}`);
 
   // -------------------------------------------------------------------------
+  console.log('\n5b. naming each attendee on a manual order');
+
+  // Quantity 5 used to mean five tickets all called the same thing. That is
+  // right for a family and wrong for a company buying passes, so the names are
+  // optional and positional rather than either behaviour being imposed.
+  r = await api('/api/tickets/create-order', {
+    method: 'POST',
+    body: {
+      customerName: 'Acme Corp',
+      email: null,
+      tickets: [{
+        eventId: show.id,
+        ticketTypeId: child.id,
+        name: 'Acme Corp',
+        quantity: 3,
+        attendeeNames: ['Ada Lovelace', '', 'Grace Hopper'],
+      }],
+    },
+  });
+  check('an order with per-attendee names is accepted', r.status === 201 || r.status === 200,
+    `${r.status} ${r.raw}`);
+
+  const named = await q(
+    `SELECT name FROM tickets WHERE ticket_type_id = $1 AND shop_id = $2 ORDER BY id`, [child.id, A]
+  );
+  const namesOnly = named.map((t) => t.name);
+  check('each name lands on its own ticket',
+    namesOnly.includes('Ada Lovelace') && namesOnly.includes('Grace Hopper'), JSON.stringify(namesOnly));
+  check('a blank entry falls back to the order name',
+    namesOnly.filter((n) => n === 'Acme Corp').length === 1, JSON.stringify(namesOnly));
+  check('  ...and the count is still the quantity asked for',
+    namesOnly.filter((n) => ['Ada Lovelace', 'Grace Hopper', 'Acme Corp'].includes(n)).length >= 3,
+    JSON.stringify(namesOnly));
+
+  // Omitting the array entirely must behave exactly as before.
+  r = await api('/api/tickets/create-order', {
+    method: 'POST',
+    body: {
+      customerName: 'Family',
+      email: null,
+      tickets: [{ eventId: show.id, ticketTypeId: adult.id, name: 'The Smiths', quantity: 4 }],
+    },
+  });
+  check('omitting the names still works', r.status === 201 || r.status === 200, `${r.status} ${r.raw}`);
+  const family = await q(
+    "SELECT name FROM tickets WHERE ticket_type_id = $1 AND shop_id = $2 AND name = 'The Smiths'", [adult.id, A]
+  );
+  check('  ...giving every ticket the line name, as before', family.length === 4, String(family.length));
+
+  // -------------------------------------------------------------------------
   console.log('\n6. a type with issued tickets is protected');
 
   r = await api(`/api/events/${show.id}/ticket-types/${vip.id}`, { method: 'DELETE' });

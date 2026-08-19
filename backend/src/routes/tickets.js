@@ -157,6 +157,8 @@ router.post('/create-order',
   body('tickets.*.eventId').isInt(),
   body('tickets.*.name').trim().notEmpty(),
   body('tickets.*.quantity').isInt({ min: 1, max: 50 }),
+  body('tickets.*.attendeeNames').optional().isArray({ max: 50 }),
+  body('tickets.*.attendeeNames.*').optional({ nullable: true }).isString().trim(),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -214,7 +216,15 @@ router.post('/create-order',
         const { eventId, name, quantity } = ticketItem;
         const ticketQuantity = quantity || 1;
 
+        // One name per LINE was the only option, so quantity 5 produced five
+        // tickets all called the same thing. Fine for a family; wrong for a
+        // company buying five passes, where the door needs to know who is who.
+        // attendeeNames is optional and positional - a blank entry, or none at
+        // all, falls back to the line's name, so the simple case is unchanged.
+        const attendeeNames = Array.isArray(ticketItem.attendeeNames) ? ticketItem.attendeeNames : [];
+
         for (let i = 0; i < ticketQuantity; i++) {
+          const attendeeName = String(attendeeNames[i] ?? '').trim() || name;
           const ticketUuid = uuidv4();
           const verifyUrl = `${process.env.FRONTEND_URL}/verify/${ticketUuid}`;
 
@@ -225,7 +235,7 @@ router.post('/create-order',
                               WHERE event_id = $2 AND shop_id = $1 AND active = true
                               ORDER BY sort_order, id LIMIT 1)),
                $4, $5, $6, $7) RETURNING *`,
-            [req.shopId, eventId, ticketItem.ticketTypeId || null, name, customerEmail, ticketUuid, manualOrderId]
+            [req.shopId, eventId, ticketItem.ticketTypeId || null, attendeeName, customerEmail, ticketUuid, manualOrderId]
           );
           const ticket = result.rows[0];
           const qrCodeDataUrl = await QRCode.toDataURL(verifyUrl);
