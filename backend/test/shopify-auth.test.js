@@ -106,7 +106,7 @@ function sessionToken(overrides = {}) {
   const shopId = (await q("INSERT INTO shops (domain) VALUES ('shop-a.myshopify.com') RETURNING id"))[0].id;
   await db.query("INSERT INTO settings (shop_id, org_name, auto_send_emails) VALUES ($1,'A',false)", [shopId]);
   const eventId = (await q(
-    "INSERT INTO events (shop_id, name, event_date, active) VALUES ($1,'Fest','2026-09-01',true) RETURNING id",
+    "INSERT INTO events (shop_id, name, starts_at, active) VALUES ($1,'Fest','2026-09-01',true) RETURNING id",
     [shopId]
   ))[0].id;
   // Order matching resolves line items through ticket types, not events.

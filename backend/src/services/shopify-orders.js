@@ -18,6 +18,7 @@ const QRCode = require('qrcode');
 const db = require('../config/database');
 const { sendTicketEmail, sendAdminNotification } = require('./email');
 const capacity = require('./capacity');
+const { emailsSentToday } = require('./email-quota');
 
 const DAILY_EMAIL_LIMIT = 100;
 const VOIDABLE_FROM_STATUSES = ['valid'];
@@ -34,19 +35,7 @@ function customerNameOf(customer) {
   return `${customer.first_name} ${customer.last_name || ''}`.trim();
 }
 
-function startOfToday() {
-  const d = new Date();
-  d.setHours(0, 0, 0, 0);
-  return d;
-}
 
-async function emailsSentToday(shopId) {
-  const result = await db.query(
-    'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
-    [shopId, startOfToday()]
-  );
-  return parseInt(result.rows[0].sent_today, 10);
-}
 
 async function autoSendEmailsEnabled(shopId) {
   const result = await db.query('SELECT auto_send_emails FROM settings WHERE shop_id = $1', [shopId]);

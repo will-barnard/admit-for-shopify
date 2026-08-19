@@ -1,4 +1,24 @@
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+/**
+ * Hand back naive dates and timestamps exactly as Postgres stores them.
+ *
+ * By default node-postgres turns DATE and TIMESTAMP WITHOUT TIME ZONE into a
+ * JS Date by interpreting them in the SERVER PROCESS's zone, and Express then
+ * serialises that to UTC. So an event starting at 10:00 came out of the API as
+ * "2026-11-14T16:00:00.000Z" on a machine set to America/Chicago - six hours
+ * wrong - and right only by accident on a container running UTC.
+ *
+ * These columns have no zone because they are not meant to have one: a venue
+ * saying "doors at 7 on the 14th" means local wall-clock time, and so does the
+ * person on the door checking a day pass. Returning the raw string keeps that
+ * meaning intact end to end.
+ *
+ * TIMESTAMPTZ (1184) is deliberately left alone - that one really does carry a
+ * zone, and a Date is the right thing for it.
+ */
+types.setTypeParser(1082, (value) => value); // date
+types.setTypeParser(1114, (value) => value); // timestamp without time zone
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,

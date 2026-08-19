@@ -570,6 +570,124 @@ async function runMigrations() {
     `);
     console.log('\u2713 Email job tables created');
 
+    // ------------------------------------------------------------------
+    // Events get a real start and end
+    //
+    // event_date DATE + event_time TIME cannot express a two-day pass, an
+    // evening that runs past midnight, or a festival weekend. Every such show
+    // had to become several events, which then fragmented the stats and the
+    // archive.
+    //
+    // starts_at becomes the source of truth. event_date and event_time are
+    // kept as GENERATED columns derived from it, so the twenty-odd places that
+    // read them - stats, the ticket email, the scanner, the dashboard - carry
+    // on working unchanged, and the database guarantees they can never drift
+    // from starts_at the way a dual-write would.
+    //
+    // The timestamps are deliberately naive (no time zone). A venue means
+    // local wall-clock time by "doors at 7 on the 14th", and the door staff
+    // checking a day pass mean the same thing. Introducing UTC here would mean
+    // storing a shop time zone and re-interpreting every existing row.
+    // ------------------------------------------------------------------
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'events' AND column_name = 'starts_at'
+        ) THEN
+          ALTER TABLE events ADD COLUMN starts_at TIMESTAMP;
+          ALTER TABLE events ADD COLUMN ends_at TIMESTAMP;
+        END IF;
+      END $$;
+    `);
+
+    // Backfill from whatever the old columns hold. Runs before they become
+    // generated, and only fills rows that have no start yet, so it is safe to
+    // re-run.
+    await db.query(`
+      UPDATE events
+         SET starts_at = event_date + COALESCE(event_time, TIME '00:00')
+       WHERE starts_at IS NULL AND event_date IS NOT NULL
+    `);
+
+    const unfilled = await db.query('SELECT COUNT(*)::int AS c FROM events WHERE starts_at IS NULL');
+    if (unfilled.rows[0].c > 0) {
+      throw new Error(
+        `${unfilled.rows[0].c} event(s) have no starts_at after backfill - refusing to convert `
+        + 'event_date to a generated column while that is true, because the conversion drops it.'
+      );
+    }
+
+    await db.query(`
+      DO $$
+      BEGIN
+        IF EXISTS (SELECT 1 FROM events) OR TRUE THEN
+          BEGIN
+            ALTER TABLE events ALTER COLUMN starts_at SET NOT NULL;
+          EXCEPTION WHEN others THEN
+            NULL;
+          END;
+        END IF;
+      END $$;
+    `);
+
+    // Replace event_date / event_time with generated equivalents.
+    //
+    // event_time reads NULL at exactly midnight. An event with no time used to
+    // store NULL, and the UI hides the Time row when it is absent; a plain cast
+    // would have turned every one of those into "00:00" overnight. The trade is
+    // that a genuine midnight start also reads as "no time", which for a
+    // ticketed event is a rounding error - and starts_at still holds the truth.
+    //
+    // The expression is compared, not just the fact of being generated, so
+    // changing the rule here re-applies it rather than silently doing nothing.
+    const EVENT_DATE_EXPR = '(starts_at)::date';
+    const EVENT_TIME_EXPR =
+      "CASE WHEN ((starts_at)::time without time zone = '00:00:00'::time without time zone) "
+      + 'THEN NULL::time without time zone ELSE (starts_at)::time without time zone END';
+
+    const generated = await db.query(`
+      SELECT column_name, is_generated, generation_expression
+        FROM information_schema.columns
+       WHERE table_name = 'events' AND column_name IN ('event_date', 'event_time')
+    `);
+    const byName = Object.fromEntries(generated.rows.map((r) => [r.column_name, r]));
+    const needsRebuild =
+      byName.event_date?.is_generated !== 'ALWAYS'
+      || byName.event_time?.is_generated !== 'ALWAYS'
+      || byName.event_date?.generation_expression !== EVENT_DATE_EXPR
+      || byName.event_time?.generation_expression !== EVENT_TIME_EXPR;
+
+    if (needsRebuild) {
+      await db.query('DROP INDEX IF EXISTS idx_events_date');
+      await db.query('ALTER TABLE events DROP COLUMN IF EXISTS event_date');
+      await db.query('ALTER TABLE events DROP COLUMN IF EXISTS event_time');
+      await db.query(`
+        ALTER TABLE events
+          ADD COLUMN event_date DATE GENERATED ALWAYS AS ((starts_at)::date) STORED,
+          ADD COLUMN event_time TIME GENERATED ALWAYS AS (
+            CASE WHEN (starts_at)::time = TIME '00:00' THEN NULL ELSE (starts_at)::time END
+          ) STORED
+      `);
+      await db.query('ALTER TABLE events ALTER COLUMN event_date SET NOT NULL');
+      await db.query('CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date)');
+    }
+
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'events_end_after_start'
+        ) THEN
+          ALTER TABLE events ADD CONSTRAINT events_end_after_start
+            CHECK (ends_at IS NULL OR ends_at >= starts_at);
+        END IF;
+      END $$;
+    `);
+    await db.query('CREATE INDEX IF NOT EXISTS idx_events_starts_at ON events(shop_id, starts_at DESC)');
+    console.log('\u2713 events.starts_at / ends_at ensured');
+
     console.log('Migrations completed successfully!');
     process.exit(0);
   } catch (error) {

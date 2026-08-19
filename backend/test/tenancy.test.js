@@ -78,10 +78,10 @@ const q = (t, p) => db.query(t, p).then((r) => r.rows);
 
   // Same SKU in both shops - this is the case the old global UNIQUE(sku) forbade.
   const evA = (await q(
-    `INSERT INTO events (shop_id, name, event_date, sku) VALUES ($1,'A Fest','2026-09-01','SHARED-SKU') RETURNING id`, [A]
+    `INSERT INTO events (shop_id, name, starts_at, sku) VALUES ($1,'A Fest','2026-09-01','SHARED-SKU') RETURNING id`, [A]
   ))[0].id;
   const evB = (await q(
-    `INSERT INTO events (shop_id, name, event_date, sku) VALUES ($1,'B Fest','2026-09-01','SHARED-SKU') RETURNING id`, [B]
+    `INSERT INTO events (shop_id, name, starts_at, sku) VALUES ($1,'B Fest','2026-09-01','SHARED-SKU') RETURNING id`, [B]
   ))[0].id;
   check('same SKU allowed in two shops', Boolean(evA && evB));
 

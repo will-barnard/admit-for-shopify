@@ -50,8 +50,7 @@
             </div>
             <p v-if="event.description" class="event-desc">{{ event.description }}</p>
             <div class="event-meta">
-              <span v-if="event.event_date"><strong>Date:</strong> {{ formatDate(event.event_date) }}</span>
-              <span v-if="event.event_time"><strong>Time:</strong> {{ event.event_time }}</span>
+              <span v-if="event.starts_at"><strong>When:</strong> {{ formatWhen(event) }}</span>
               <span v-if="event.location"><strong>Location:</strong> {{ event.location }}</span>
               <span v-if="event.archived && event.archived_at">
                 <strong>Archived:</strong> {{ formatDate(event.archived_at) }}
@@ -142,17 +141,33 @@
           </div>
           <div class="form-row">
             <div class="form-group">
-              <label>Event Date</label>
-              <input v-model="form.event_date" type="date" />
+              <label>Start Date *</label>
+              <input v-model="form.start_date" type="date" required />
             </div>
             <div class="form-group">
               <label>Start Time</label>
-              <!-- A real time input, because the column behind this is a
-                   Postgres `time`. The old free-text field hinted at a RANGE
-                   ("10:00 AM - 6:00 PM"), which the database rejected and the
-                   API reported as a bare 500. -->
-              <input v-model="form.event_time" type="time" />
-              <p class="hint">Doors/finish times go in the description for now.</p>
+              <input v-model="form.start_time" type="time" />
+              <p class="hint">Leave blank if the time is not settled.</p>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input v-model="form.has_end" type="checkbox" @change="onHasEndChanged" />
+              Runs until a later date or time
+            </label>
+            <p class="hint">A two-day pass, a festival weekend, or an evening that runs past midnight.</p>
+          </div>
+
+          <div v-if="form.has_end" class="form-row">
+            <div class="form-group">
+              <label>End Date</label>
+              <input v-model="form.end_date" type="date" />
+            </div>
+            <div class="form-group">
+              <label>End Time</label>
+              <input v-model="form.end_time" type="time" />
+              <p class="hint">Blank means the end of that day.</p>
             </div>
           </div>
           <div class="form-group">
@@ -279,8 +294,11 @@ export default {
     const form = reactive({
       name: '',
       description: '',
-      event_date: '',
-      event_time: '',
+      start_date: '',
+      start_time: '',
+      has_end: false,
+      end_date: '',
+      end_time: '',
       location: '',
       active: true
     });
@@ -308,6 +326,51 @@ export default {
       ticket_count: 0,
       picked_label: ''
     });
+
+    // Timestamps come back naive (no zone) because that is how they are stored:
+    // a venue means local wall-clock time. Split the string rather than going
+    // through Date, which would reinterpret it in the browser's zone and could
+    // move the day.
+    const splitStamp = (value) => {
+      if (!value) return { date: '', time: '' };
+      const [datePart, timePart = ''] = String(value).replace('T', ' ').split(' ');
+      const hhmm = timePart.slice(0, 5);
+      return { date: datePart, time: hhmm === '00:00' ? '' : hhmm };
+    };
+
+    const prettyDate = (value) => {
+      const { date } = splitStamp(value);
+      if (!date) return '';
+      const [y, m, d] = date.split('-').map(Number);
+      return new Date(y, m - 1, d).toLocaleDateString(undefined, {
+        weekday: 'short', month: 'short', day: 'numeric', year: 'numeric',
+      });
+    };
+
+    const prettyTime = (value) => {
+      const { time } = splitStamp(value);
+      if (!time) return '';
+      const [h, min] = time.split(':').map(Number);
+      return new Date(2000, 0, 1, h, min).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+    };
+
+    // One line covering both shapes: a single evening, or a run of days.
+    const formatWhen = (event) => {
+      const start = splitStamp(event.starts_at);
+      const end = splitStamp(event.ends_at);
+      const startText = [prettyDate(event.starts_at), prettyTime(event.starts_at)].filter(Boolean).join(', ');
+      if (!event.ends_at) return startText;
+      if (end.date === start.date) {
+        const endTime = prettyTime(event.ends_at);
+        return endTime ? `${startText} – ${endTime}` : startText;
+      }
+      return `${startText} – ${[prettyDate(event.ends_at), prettyTime(event.ends_at)].filter(Boolean).join(', ')}`;
+    };
+
+    const onHasEndChanged = () => {
+      if (form.has_end && !form.end_date) form.end_date = form.start_date;
+      if (!form.has_end) { form.end_date = ''; form.end_time = ''; }
+    };
 
     const isMapped = (t) => Boolean(t.shopify_variant_id || t.shopify_sku);
 
@@ -348,8 +411,11 @@ export default {
     const resetForm = () => {
       form.name = '';
       form.description = '';
-      form.event_date = '';
-      form.event_time = '';
+      form.start_date = '';
+      form.start_time = '';
+      form.has_end = false;
+      form.end_date = '';
+      form.end_time = '';
       form.location = '';
       form.active = true;
       types.value = [blankType('General Admission')];
@@ -381,8 +447,13 @@ export default {
       editingEvent.value = event;
       form.name = event.name;
       form.description = event.description || '';
-      form.event_date = event.event_date ? event.event_date.split('T')[0] : '';
-      form.event_time = (event.event_time || '').slice(0, 5);
+      const start = splitStamp(event.starts_at);
+      const end = splitStamp(event.ends_at);
+      form.start_date = start.date;
+      form.start_time = start.time;
+      form.has_end = Boolean(event.ends_at);
+      form.end_date = end.date;
+      form.end_time = end.time;
       form.location = event.location || '';
       form.active = event.active;
       showModal.value = true;
@@ -479,8 +550,25 @@ export default {
       }
 
       try {
-        const payload = { ...form };
-        if (!payload.event_date) payload.event_date = null;
+        // Compose the naive timestamps the API expects. A blank start time
+        // means midnight, which is how "no time set" is stored - the API reads
+        // it back as no time.
+        const payload = {
+          name: form.name,
+          description: form.description,
+          location: form.location,
+          active: form.active,
+          starts_at: `${form.start_date} ${form.start_time || '00:00'}`,
+          // A bare end date means the end of that day; the API applies that.
+          ends_at: form.has_end && form.end_date
+            ? (form.end_time ? `${form.end_date} ${form.end_time}` : form.end_date)
+            : null,
+        };
+        if (!form.start_date) {
+          modalError.value = 'An event needs a start date';
+          saving.value = false;
+          return;
+        }
 
         if (!editingEvent.value) {
           await axios.post('/api/events', { ...payload, ticket_types: rows });
@@ -566,7 +654,7 @@ export default {
       embedded, picking, pickFor, adminProductUrl,
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
       archiveEvent, unarchiveEvent, loadEvents,
-      formatDate, showChangePassword, handleLogout
+      formatDate, formatWhen, onHasEndChanged, showChangePassword, handleLogout
     };
   }
 };

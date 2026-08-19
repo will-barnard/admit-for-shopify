@@ -78,7 +78,7 @@ async function api(path, { method = 'GET', body, role = 'superadmin', shopDomain
   const B = (await q("INSERT INTO shops (domain) VALUES ('other-shop.test') RETURNING id"))[0].id;
   await db.query("INSERT INTO settings (shop_id, org_name) VALUES ($1,'A'), ($2,'B')", [A, B]);
   const eventA = (await q(
-    "INSERT INTO events (shop_id, name, event_date) VALUES ($1,'Jobs Fest','2026-12-01') RETURNING id", [A]
+    "INSERT INTO events (shop_id, name, starts_at) VALUES ($1,'Jobs Fest','2026-12-01') RETURNING id", [A]
   ))[0].id;
 
   const holders = ['a@x.test', 'b@x.test', 'c@x.test', 'd@x.test'];
@@ -336,6 +336,39 @@ async function api(path, { method = 'GET', body, role = 'superadmin', shopDomain
     && listed[tickets[2].id].scans.scannedBy === null,
     JSON.stringify(listed[tickets[2].id].scans));
   check('every ticket is still returned', r.body.tickets.length === 4, String(r.body.tickets.length));
+
+  // -------------------------------------------------------------------------
+  console.log('\n12. naive times and the daily boundary do not drift with TZ');
+
+  // Run this file under TZ=Asia/Tokyo or America/Chicago and these must still
+  // hold. Before, node-postgres turned a naive timestamp into a JS Date in the
+  // process's zone, so an event at 10:00 came back six hours out - and every
+  // quota check built "today" from the app clock while sent_at came from the
+  // database clock, so the boundary moved by whole hours between them.
+  const naive = (await q("SELECT '2026-11-14 10:00'::timestamp AS t, '2026-11-14'::date AS d"))[0];
+  check('a naive timestamp comes back as the same wall clock',
+    String(naive.t).startsWith('2026-11-14 10:00'), JSON.stringify(naive.t));
+  check('  ...and a date does not shift a day', String(naive.d) === '2026-11-14', JSON.stringify(naive.d));
+  check('  ...neither is a Date the driver reinterpreted',
+    !(naive.t instanceof Date) && !(naive.d instanceof Date));
+
+  // The quota boundary is the DATABASE's midnight, so an entry logged just
+  // before it counts for yesterday and one after counts for today, whatever
+  // zone this process happens to be running in.
+  const quotaShop = (await q("INSERT INTO shops (domain) VALUES ('quota.test') RETURNING id"))[0].id;
+  await db.query("INSERT INTO settings (shop_id, org_name) VALUES ($1,'Q')", [quotaShop]);
+  await db.query(
+    `INSERT INTO email_send_log (shop_id, recipient_email, send_type, success, sent_at) VALUES
+       ($1,'y@x.test','bulk_email',true, date_trunc('day', LOCALTIMESTAMP) - INTERVAL '1 second'),
+       ($1,'t@x.test','bulk_email',true, date_trunc('day', LOCALTIMESTAMP) + INTERVAL '1 second')`,
+    [quotaShop]
+  );
+  const quota = require('../src/services/email-quota');
+  check('only today\'s send counts against the quota',
+    (await quota.emailsSentToday(quotaShop)) === 1, String(await quota.emailsSentToday(quotaShop)));
+  check('  ...and the remainder follows from it',
+    (await quota.remainingQuota(quotaShop)) === quota.DAILY_LIMIT - 1,
+    String(await quota.remainingQuota(quotaShop)));
 
   console.log(`\n${pass} passed, ${fail} failed`);
   emailJobs.stopWorker();

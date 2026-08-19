@@ -22,6 +22,45 @@ const canManageEvents = requireRole('admin', 'superadmin');
  */
 const TIME_PATTERN = /^([01]?\d|2[0-3]):[0-5]\d(:[0-5]\d)?$|^(0?[1-9]|1[0-2]):[0-5]\d\s*([AaPp][Mm])$/;
 
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Work out the event's window from whatever the caller sent.
+ *
+ * starts_at is the source of truth now, but event_date + event_time is still
+ * accepted: it is what the legacy Flow integration sends, and what every
+ * existing caller sends. The two columns are GENERATED from starts_at, so they
+ * can no longer be written to directly - this is where the translation happens.
+ *
+ * The actual composition is left to Postgres ($date::date + $time::time)
+ * rather than parsed here, so "7:00 PM" and "19:00" both work without this
+ * file growing a clock parser.
+ *
+ * An ends_at given as a bare date means the END of that day, because that is
+ * what "a two-day pass through the 15th" means to the person typing it.
+ */
+function resolveWindow(body) {
+  const startsAt = (body.starts_at || '').trim();
+  const eventDate = (body.event_date || '').trim();
+
+  if (!startsAt && !eventDate) {
+    return { error: 'An event needs a start - send starts_at, or event_date.' };
+  }
+
+  let endsAt = (body.ends_at || '').trim() || null;
+  if (endsAt && DATE_ONLY.test(endsAt)) endsAt = `${endsAt} 23:59:59`;
+
+  return {
+    startsAt: startsAt || null,
+    eventDate: eventDate || null,
+    eventTime: (body.event_time || '').trim() || null,
+    endsAt,
+  };
+}
+
+// Composes starts_at from either form, in SQL. $1 starts_at, $2 date, $3 time.
+const STARTS_AT_SQL = "COALESCE($1::timestamp, $2::date + COALESCE($3::time, TIME '00:00'))";
+
 function invalidTime(value) {
   if (value === undefined || value === null || value === '') return null;
   if (TIME_PATTERN.test(String(value).trim())) return null;
@@ -58,7 +97,7 @@ router.get('/', authMiddleware, async (req, res) => {
        FROM events e
        WHERE e.shop_id = $1
        ${archivedClause}
-       ORDER BY e.event_date DESC, e.created_at DESC`,
+       ORDER BY e.starts_at DESC, e.created_at DESC`,
       [req.shopId]
     );
     res.json(result.rows);
@@ -94,7 +133,9 @@ router.post('/',
   authMiddleware,
   canManageEvents,
   body('name').trim().notEmpty().withMessage('Event name is required'),
-  body('event_date').notEmpty().withMessage('Event date is required'),
+  // Either starts_at or event_date is required; resolveWindow decides, because
+  // "one of these two" is not something a per-field validator can express.
+  body('event_date').optional({ nullable: true, checkFalsy: true }),
   body('sku').optional({ nullable: true, checkFalsy: true }).trim(),
   body('location').optional({ nullable: true, checkFalsy: true }).trim(),
   body('description').optional({ nullable: true, checkFalsy: true }).trim(),
@@ -106,16 +147,20 @@ router.post('/',
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, description, event_date, event_time, location, sku } = req.body;
+      const { name, description, location, sku } = req.body;
 
-      const timeProblem = invalidTime(event_time);
+      const timeProblem = invalidTime(req.body.event_time);
       if (timeProblem) return res.status(400).json(timeProblem);
+
+      const window = resolveWindow(req.body);
+      if (window.error) return res.status(400).json({ error: window.error });
 
       const created = await db.withTransaction(async (client) => {
         const eventResult = await client.query(
-          `INSERT INTO events (shop_id, name, description, event_date, event_time, location)
-           VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-          [req.shopId, name, description || null, event_date, event_time || null, location || null]
+          `INSERT INTO events (shop_id, name, description, starts_at, ends_at, location)
+           VALUES ($4, $5, $6, ${STARTS_AT_SQL}, $7::timestamp, $8) RETURNING *`,
+          [window.startsAt, window.eventDate, window.eventTime,
+           req.shopId, name, description || null, window.endsAt, location || null]
         );
         const event = eventResult.rows[0];
 
@@ -143,6 +188,12 @@ router.post('/',
 
       res.status(201).json(created);
     } catch (error) {
+      if (error.code === '23514' && error.constraint === 'events_end_after_start') {
+        return res.status(400).json({ error: 'The event cannot end before it starts.' });
+      }
+      if (error.code === '22007' || error.code === '22008') {
+        return res.status(400).json({ error: 'That start or end time could not be read as a date and time.' });
+      }
       console.error('Error creating event:', error);
       res.status(500).json({ error: 'Server error' });
     }
@@ -154,7 +205,9 @@ router.put('/:id',
   authMiddleware,
   canManageEvents,
   body('name').trim().notEmpty().withMessage('Event name is required'),
-  body('event_date').notEmpty().withMessage('Event date is required'),
+  // Either starts_at or event_date is required; resolveWindow decides, because
+  // "one of these two" is not something a per-field validator can express.
+  body('event_date').optional({ nullable: true, checkFalsy: true }),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -163,18 +216,22 @@ router.put('/:id',
       }
 
       const { id } = req.params;
-      const { name, description, event_date, event_time, location, active } = req.body;
+      const { name, description, location, active } = req.body;
 
-      const timeProblem = invalidTime(event_time);
+      const timeProblem = invalidTime(req.body.event_time);
       if (timeProblem) return res.status(400).json(timeProblem);
+
+      const window = resolveWindow(req.body);
+      if (window.error) return res.status(400).json({ error: window.error });
 
       // events.sku is no longer written - the Shopify mapping lives on
       // event_ticket_types. The column is retained for historical rows.
       const result = await db.query(
-        `UPDATE events SET name = $1, description = $2, event_date = $3, event_time = $4,
-         location = $5, active = $6, updated_at = NOW()
-         WHERE id = $7 AND shop_id = $8 RETURNING *`,
-        [name, description || null, event_date, event_time || null, location || null, active !== false, id, req.shopId]
+        `UPDATE events SET name = $4, description = $5, starts_at = ${STARTS_AT_SQL},
+         ends_at = $6::timestamp, location = $7, active = $8, updated_at = NOW()
+         WHERE id = $9 AND shop_id = $10 RETURNING *`,
+        [window.startsAt, window.eventDate, window.eventTime,
+         name, description || null, window.endsAt, location || null, active !== false, id, req.shopId]
       );
 
       if (result.rows.length === 0) {
@@ -183,6 +240,12 @@ router.put('/:id',
 
       res.json(result.rows[0]);
     } catch (error) {
+      if (error.code === '23514' && error.constraint === 'events_end_after_start') {
+        return res.status(400).json({ error: 'The event cannot end before it starts.' });
+      }
+      if (error.code === '22007' || error.code === '22008') {
+        return res.status(400).json({ error: 'That start or end time could not be read as a date and time.' });
+      }
       console.error('Error updating event:', error);
       res.status(500).json({ error: 'Server error' });
     }
@@ -224,7 +287,7 @@ router.delete('/:id', authMiddleware, canManageEvents, async (req, res) => {
 router.get('/list/active', authMiddleware, async (req, res) => {
   try {
     const result = await db.query(
-      `SELECT e.id, e.name, e.event_date,
+      `SELECT e.id, e.name, e.event_date, e.starts_at, e.ends_at,
               COALESCE((
                 SELECT json_agg(json_build_object('id', tt.id, 'name', tt.name)
                                 ORDER BY tt.sort_order, tt.id)
@@ -235,7 +298,7 @@ router.get('/list/active', authMiddleware, async (req, res) => {
         WHERE e.shop_id = $1
           AND e.active = true
           AND (e.archived IS NULL OR e.archived = false)
-        ORDER BY e.event_date ASC`,
+        ORDER BY e.starts_at ASC`,
       [req.shopId]
     );
     res.json(result.rows);

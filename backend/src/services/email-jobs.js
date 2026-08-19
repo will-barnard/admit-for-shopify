@@ -23,9 +23,9 @@
 
 const db = require('../config/database');
 const { sendViaResend, getSender } = require('./email');
+const { DAILY_LIMIT, remainingQuota } = require('./email-quota');
 
 const SEND_INTERVAL_MS = Number(process.env.BULK_EMAIL_INTERVAL_MS ?? 6000);
-const DAILY_LIMIT = Number(process.env.EMAIL_DAILY_LIMIT ?? 100);
 const IDLE_POLL_MS = Number(process.env.BULK_EMAIL_POLL_MS ?? 5000);
 
 const lockKey = (jobId) => `email-job:${jobId}`;
@@ -59,20 +59,6 @@ function renderEmail({ body, showTicketHolder, logoImgUrl, orgName }, recipient)
               ${footer}
             </div>
           `;
-}
-
-async function emailsSentToday(shopId) {
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const result = await db.query(
-    'SELECT COUNT(*) AS c FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
-    [shopId, todayStart]
-  );
-  return parseInt(result.rows[0].c, 10);
-}
-
-async function remainingQuota(shopId) {
-  return Math.max(0, DAILY_LIMIT - (await emailsSentToday(shopId)));
 }
 
 /**

@@ -147,6 +147,108 @@ const q = (t, p) => db.query(t, p).then((r) => r.rows);
   check('editing an event checks the time as well', r.status === 400, `${r.status} ${r.raw}`);
 
   // -------------------------------------------------------------------------
+  console.log('\n1c. an event has a start and an end');
+
+  // event_date + event_time could not express a two-day pass or an evening
+  // running past midnight, so every such show had to become several events -
+  // which then fragmented the stats and the archive. starts_at is the source of
+  // truth now; event_date and event_time are GENERATED from it, so everything
+  // that reads them keeps working.
+  r = await api('/api/events', {
+    method: 'POST',
+    body: {
+      name: 'Drum Weekend',
+      starts_at: '2026-11-14 10:00',
+      ends_at: '2026-11-15 18:00',
+    },
+  });
+  check('a multi-day event can be created', r.status === 201, `${r.status} ${r.raw}`);
+  const weekend = r.body;
+  check('  ...keeping its start', String(weekend.starts_at).includes('2026-11-14'), String(weekend.starts_at));
+  check('  ...and its end on a different day',
+    String(weekend.ends_at).includes('2026-11-15'), String(weekend.ends_at));
+  check('event_date is derived from the start',
+    String(weekend.event_date).includes('2026-11-14'), String(weekend.event_date));
+  check('event_time is derived too', String(weekend.event_time).startsWith('10:00'), String(weekend.event_time));
+
+  // The generated columns are the database's job, not the route's - prove they
+  // follow starts_at rather than being written alongside it. On an event with
+  // no end, so the end-after-start constraint is not what is under test here.
+  const probeId = (await q(
+    "INSERT INTO events (shop_id, name, starts_at) VALUES ($1,'Derivation probe','2026-06-01 12:00') RETURNING id", [A]
+  ))[0].id;
+  await db.query("UPDATE events SET starts_at = '2027-01-02 08:15' WHERE id = $1", [probeId]);
+  const derived = (await q(
+    'SELECT event_date::text AS d, event_time::text AS t FROM events WHERE id = $1', [probeId]
+  ))[0];
+  check('changing starts_at alone moves event_date', derived.d === '2027-01-02', derived.d);
+  check('  ...and event_time', derived.t === '08:15:00', derived.t);
+
+  // And the constraint is real, not just a route-level check.
+  let constraintHeld = false;
+  try {
+    await db.query("UPDATE events SET ends_at = '2026-01-01' WHERE id = $1", [probeId]);
+  } catch (e) {
+    constraintHeld = e.constraint === 'events_end_after_start';
+  }
+  check('the database itself refuses an end before the start', constraintHeld);
+  await db.query('DELETE FROM events WHERE id = $1', [probeId]);
+
+  // A bare end date means the end OF that day - "a two-day pass through the
+  // 15th" does not mean it expires at midnight as the 15th begins.
+  r = await api('/api/events', {
+    method: 'POST',
+    body: { name: 'Through Sunday', starts_at: '2026-11-14 10:00', ends_at: '2026-11-15' },
+  });
+  check('a bare end date means the end of that day',
+    r.status === 201 && /23:59/.test(String(r.body.ends_at)), `${r.status} ${String(r.body?.ends_at)}`);
+
+  r = await api('/api/events', {
+    method: 'POST',
+    body: { name: 'Backwards', starts_at: '2026-11-15 10:00', ends_at: '2026-11-14 10:00' },
+  });
+  check('an end before the start is refused', r.status === 400, `${r.status} ${r.raw}`);
+  check('  ...in words', /cannot end before it starts/i.test(r.body?.error || ''), r.body?.error);
+
+  r = await api('/api/events', { method: 'POST', body: { name: 'Whenever' } });
+  check('an event with no start at all is refused', r.status === 400, `${r.status} ${r.raw}`);
+
+  // The legacy shape is still accepted - it is what the Flow integration sends.
+  r = await api('/api/events', {
+    method: 'POST',
+    body: { name: 'Legacy shape', event_date: '2026-12-20', event_time: '7:00 PM' },
+  });
+  check('event_date + event_time still works', r.status === 201, `${r.status} ${r.raw}`);
+  check('  ...composed into starts_at', String(r.body.starts_at).includes('2026-12-20'), String(r.body.starts_at));
+  check('  ...with 7:00 PM read as 19:00', String(r.body.event_time).startsWith('19:00'), String(r.body.event_time));
+
+  r = await api('/api/events', {
+    method: 'POST', body: { name: 'Legacy no time', event_date: '2026-12-21' },
+  });
+  check('a legacy event with no time still reads as having none',
+    r.status === 201 && r.body.event_time === null, `${r.status} ${String(r.body?.event_time)}`);
+  check('  ...while starting at midnight underneath',
+    String(r.body.starts_at).includes('2026-12-21'), String(r.body.starts_at));
+
+  r = await api(`/api/events/${weekend.id}`, {
+    method: 'PUT',
+    body: { name: 'Drum Weekend', starts_at: '2026-11-14 09:00', ends_at: '2026-11-16 18:00' },
+  });
+  check('editing can extend the run', r.status === 200 && String(r.body.ends_at).includes('2026-11-16'),
+    `${r.status} ${String(r.body?.ends_at)}`);
+
+  r = await api(`/api/events/${weekend.id}`, {
+    method: 'PUT',
+    body: { name: 'Drum Weekend', starts_at: '2026-11-14 09:00', ends_at: '2026-11-13 18:00' },
+  });
+  check('editing cannot invert it either', r.status === 400, `${r.status} ${r.raw}`);
+
+  r = await api('/api/events/list/active');
+  check('the active list carries the window',
+    (r.body || []).every((e) => 'starts_at' in e && 'ends_at' in e),
+    JSON.stringify(r.body?.[0]));
+
+  // -------------------------------------------------------------------------
   console.log('\n2. an event with several ticket types');
 
   r = await api('/api/events', {
@@ -206,7 +308,7 @@ const q = (t, p) => db.query(t, p).then((r) => r.rows);
 
   // Shop B may reuse the same variant id - uniqueness is per shop.
   const bEvent = (await q(
-    "INSERT INTO events (shop_id, name, event_date) VALUES ($1,'B Show','2026-11-14') RETURNING id", [B]
+    "INSERT INTO events (shop_id, name, starts_at) VALUES ($1,'B Show','2026-11-14') RETURNING id", [B]
   ))[0].id;
   r = await api(`/api/events/${bEvent}/ticket-types`, {
     method: 'POST',

@@ -4,6 +4,7 @@ const { v4: uuidv4 } = require('uuid');
 const QRCode = require('qrcode');
 const db = require('../config/database');
 const capacity = require('../services/capacity');
+const emailQuota = require('../services/email-quota');
 const authMiddleware = require('../middleware/auth');
 const superAdminMiddleware = require('../middleware/superadmin');
 const checkLockdown = require('../middleware/lockdown');
@@ -283,16 +284,8 @@ router.post('/create-order',
       
       if (autoSendEmails && customerEmail) {
         try {
-          const todayStart = new Date();
-          todayStart.setHours(0, 0, 0, 0);
-          
-          const quotaResult = await db.query(
-            'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
-            [req.shopId, todayStart]
-          );
-          
-          const sentToday = parseInt(quotaResult.rows[0].sent_today);
-          const dailyLimit = 100;
+          const sentToday = await emailQuota.emailsSentToday(req.shopId);
+          const dailyLimit = emailQuota.DAILY_LIMIT;
           const remaining = dailyLimit - sentToday;
           
           if (remaining > 0) {
@@ -547,16 +540,8 @@ router.post('/:id/scan-status', authMiddleware, checkLockdown, async (req, res) 
 // Get remaining daily email quota
 router.get('/daily-email-quota', authMiddleware, async (req, res) => {
   try {
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    
-    const result = await db.query(
-      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
-      [req.shopId, todayStart]
-    );
-
-    const sentToday = parseInt(result.rows[0].sent_today);
-    const dailyLimit = 100;
+    const sentToday = await emailQuota.emailsSentToday(req.shopId);
+    const dailyLimit = emailQuota.DAILY_LIMIT;
     const remaining = Math.max(0, dailyLimit - sentToday);
 
     res.json({ sentToday, dailyLimit, remaining });
@@ -571,16 +556,8 @@ router.post('/batch-send-emails', authMiddleware, async (req, res) => {
   try {
     const { eventId } = req.body;
     
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    
-    const quotaResult = await db.query(
-      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
-      [req.shopId, todayStart]
-    );
-
-    const sentToday = parseInt(quotaResult.rows[0].sent_today);
-    const dailyLimit = 100;
+    const sentToday = await emailQuota.emailsSentToday(req.shopId);
+    const dailyLimit = emailQuota.DAILY_LIMIT;
     const remaining = Math.max(0, dailyLimit - sentToday);
     const batchLimit = 85;
     

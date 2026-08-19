@@ -82,7 +82,7 @@ async function api(path, { method = 'GET', body, token, headers = {} } = {}) {
   ))[0].id;
   await db.query("INSERT INTO settings (shop_id, org_name) VALUES ($1,'Sec')", [shopId]);
   const eventId = (await q(
-    "INSERT INTO events (shop_id, name, event_date) VALUES ($1,'Sec Fest','2026-12-01') RETURNING id", [shopId]
+    "INSERT INTO events (shop_id, name, starts_at) VALUES ($1,'Sec Fest','2026-12-01') RETURNING id", [shopId]
   ))[0].id;
   await db.query(
     "INSERT INTO event_ticket_types (shop_id, event_id, name) VALUES ($1,$2,'General Admission')", [shopId, eventId]
@@ -308,7 +308,7 @@ async function api(path, { method = 'GET', body, token, headers = {} } = {}) {
   ))[0].id;
   await db.query("INSERT INTO settings (shop_id, org_name) VALUES ($1,'Elsewhere')", [otherShop]);
   const otherEvent = (await q(
-    "INSERT INTO events (shop_id, name, event_date, event_time, location) VALUES ($1,'Far Fest','2026-12-05','19:00','The Barn') RETURNING id",
+    "INSERT INTO events (shop_id, name, starts_at, location) VALUES ($1,'Far Fest','2026-12-05 19:00','The Barn') RETURNING id",
     [otherShop]
   ))[0].id;
   const otherType = (await q(

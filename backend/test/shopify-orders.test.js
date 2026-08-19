@@ -32,7 +32,7 @@ async function reset() {
   );
   // One show with THREE ticket types - the shape the old one-SKU-per-event
   // model could not express - plus an archived and an inactive show.
-  await db.query(`INSERT INTO events (shop_id, name, event_date, active, archived) VALUES
+  await db.query(`INSERT INTO events (shop_id, name, starts_at, active, archived) VALUES
     ($1, 'Chicago Drum Show', '2026-09-01', true,  false),
     ($1, 'Archived Show',     '2025-09-01', true,  true),
     ($1, 'Inactive Show',     '2026-10-01', false, false)`, [SHOP]);
