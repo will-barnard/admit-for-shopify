@@ -2,6 +2,12 @@ const express = require('express');
 const { body, validationResult } = require('express-validator');
 const db = require('../config/database');
 const authMiddleware = require('../middleware/auth');
+const requireRole = require('../middleware/require-role');
+
+// Reads stay open to any signed-in user - the scanner needs the active-event
+// list. Every write is admin or superadmin: a 'verifier' door account could
+// previously create, edit, archive and delete events and their ticket types.
+const canManageEvents = requireRole('admin', 'superadmin');
 
 const router = express.Router();
 
@@ -64,6 +70,7 @@ router.get('/:id', authMiddleware, async (req, res) => {
 // Create event (protected)
 router.post('/',
   authMiddleware,
+  canManageEvents,
   body('name').trim().notEmpty().withMessage('Event name is required'),
   body('event_date').notEmpty().withMessage('Event date is required'),
   body('sku').optional({ nullable: true, checkFalsy: true }).trim(),
@@ -120,6 +127,7 @@ router.post('/',
 // Update event (protected)
 router.put('/:id',
   authMiddleware,
+  canManageEvents,
   body('name').trim().notEmpty().withMessage('Event name is required'),
   body('event_date').notEmpty().withMessage('Event date is required'),
   async (req, res) => {
@@ -154,7 +162,7 @@ router.put('/:id',
 );
 
 // Delete event (protected)
-router.delete('/:id', authMiddleware, async (req, res) => {
+router.delete('/:id', authMiddleware, canManageEvents, async (req, res) => {
   try {
     const { id } = req.params;
     
@@ -210,7 +218,7 @@ router.get('/list/active', authMiddleware, async (req, res) => {
 });
 
 // Archive an event (protected)
-router.post('/:id/archive', authMiddleware, async (req, res) => {
+router.post('/:id/archive', authMiddleware, canManageEvents, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
@@ -231,7 +239,7 @@ router.post('/:id/archive', authMiddleware, async (req, res) => {
 });
 
 // Unarchive an event (protected)
-router.post('/:id/unarchive', authMiddleware, async (req, res) => {
+router.post('/:id/unarchive', authMiddleware, canManageEvents, async (req, res) => {
   try {
     const { id } = req.params;
     const result = await db.query(
@@ -282,6 +290,7 @@ router.get('/:id/ticket-types', authMiddleware, async (req, res) => {
 // Add a ticket type
 router.post('/:id/ticket-types',
   authMiddleware,
+  canManageEvents,
   body('name').trim().notEmpty().withMessage('Ticket type name is required'),
   async (req, res) => {
     try {
@@ -321,6 +330,7 @@ router.post('/:id/ticket-types',
 // Update a ticket type
 router.put('/:id/ticket-types/:typeId',
   authMiddleware,
+  canManageEvents,
   body('name').trim().notEmpty().withMessage('Ticket type name is required'),
   async (req, res) => {
     try {
@@ -354,7 +364,7 @@ router.put('/:id/ticket-types/:typeId',
 );
 
 // Delete a ticket type
-router.delete('/:id/ticket-types/:typeId', authMiddleware, async (req, res) => {
+router.delete('/:id/ticket-types/:typeId', authMiddleware, canManageEvents, async (req, res) => {
   try {
     // Never orphan issued tickets.
     const inUse = await db.query(

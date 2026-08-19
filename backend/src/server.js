@@ -20,9 +20,17 @@ const eventRoutes = require('./routes/events');
 const shopContext = require('./middleware/shop-context');
 const shopifyAuth = require('./middleware/shopify-auth');
 const shopifyWebhookRoutes = require('./routes/shopify-webhooks');
+const { authRouteLimiter } = require('./middleware/rate-limit');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// How many proxies sit in front of this process. In the deployed topology that
+// is Beachhead's nginx-proxy and then this app's own nginx, so two. Express
+// uses it to pick the real client address out of X-Forwarded-For, which is what
+// the rate limiters key on. Set TRUST_PROXY_HOPS to match a different setup -
+// running the backend directly with nothing in front of it wants 0.
+app.set('trust proxy', Number(process.env.TRUST_PROXY_HOPS ?? 2));
 
 // Middleware
 app.use(cors());
@@ -33,7 +41,16 @@ app.use(cors());
 app.use('/api/shopify/webhooks', express.raw({ type: '*/*', limit: '5mb' }), shopifyWebhookRoutes);
 
 app.use(express.json());
-app.use('/uploads', express.static('uploads'));
+// Uploaded files are user-supplied content served from this app's own origin.
+// The upload filter no longer accepts SVG, but files uploaded before that
+// change are still on disk, so serve everything here under a CSP that permits
+// no script, no network and no framing - which neuters an SVG that carries one.
+// nosniff stops a mislabelled file being re-interpreted as HTML.
+app.use('/uploads', (req, res, next) => {
+  res.setHeader('Content-Security-Policy', "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox");
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  next();
+}, express.static('uploads'));
 
 // Identity, then tenant. shopifyAuth sets req.shopDomain from an App Bridge
 // session token when there is one; shopContext turns that into req.shopId, and
@@ -42,6 +59,9 @@ app.use('/api', shopifyAuth);
 app.use('/api', shopContext);
 
 // Routes
+// Both login endpoints are unauthenticated and run a bcrypt comparison per
+// attempt, so they are the brute-force and CPU-exhaustion surface.
+app.use('/api/auth', authRouteLimiter);
 app.use('/api/auth', authRoutes);
 app.use('/api/auth', verifierAuthRoutes);
 app.use('/api/tickets', ticketRoutes);

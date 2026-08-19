@@ -4,6 +4,7 @@ const db = require('../config/database');
 const auth = require('../middleware/auth');
 const superAdminMiddleware = require('../middleware/superadmin');
 const multer = require('multer');
+const requireRole = require('../middleware/require-role');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -23,20 +24,47 @@ const storage = multer.diskStorage({
   }
 });
 
+// SVG is deliberately absent. An SVG is an XML document that can carry
+// <script>, and uploads are served from this app's own origin - so an uploaded
+// logo would be stored XSS against the admin session, reachable by anyone who
+// can upload a logo. The old filter also matched loosely (a regex `test` on the
+// mime type, so "image/svg+xml" passed the check for "svg"); both the extension
+// and the mime type are now exact-matched against a list.
+const ALLOWED_LOGO_EXTENSIONS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+const ALLOWED_LOGO_MIMETYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+
 const upload = multer({
   storage: storage,
   limits: { fileSize: 5 * 1024 * 1024 }, // 5MB limit
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /jpeg|jpg|png|gif|svg/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
-    const mimetype = allowedTypes.test(file.mimetype);
-    if (extname && mimetype) {
+    const extname = path.extname(file.originalname).toLowerCase();
+    if (ALLOWED_LOGO_EXTENSIONS.has(extname) && ALLOWED_LOGO_MIMETYPES.has(file.mimetype)) {
       cb(null, true);
     } else {
-      cb(new Error('Only image files are allowed'));
+      cb(new Error('Logo must be a JPEG, PNG, GIF or WebP image'));
     }
   }
 });
+
+/**
+ * One CSV cell, quoted per RFC 4180 and defused for spreadsheets.
+ *
+ * Two separate problems. An embedded double quote used to end the field early,
+ * so an attendee named `Bob" ,x` shifted every later column. And Excel, Sheets
+ * and LibreOffice execute a cell that begins with = + - @, so an attendee could
+ * choose a name that runs a formula when staff open the export - the classic
+ * CSV injection. Both attendee names arrive from Shopify order payloads, which
+ * are attacker-controlled.
+ */
+function csvCell(value) {
+  if (value === null || value === undefined) return '""';
+  let str = String(value);
+  if (/^[=+\-@\t\r]/.test(str)) str = `'${str}`;
+  return `"${str.replace(/"/g, '""')}"`;
+}
+
+// Changing how the organisation presents itself is not a door-staff action.
+const canManageSettings = requireRole('admin', 'superadmin');
 
 // Get public settings (no auth - used for logo/org name on the login pages).
 // IMPORTANT: this endpoint is unauthenticated. Only ever return the columns
@@ -89,7 +117,7 @@ router.get('/admin', auth, async (req, res) => {
 });
 
 // Update settings
-router.put('/', auth, async (req, res) => {
+router.put('/', auth, canManageSettings, async (req, res) => {
   try {
     const { org_name, auto_send_emails, timezone } = req.body;
     
@@ -113,7 +141,7 @@ router.put('/', auth, async (req, res) => {
 });
 
 // Upload logo
-router.post('/logo', auth, upload.single('logo'), async (req, res) => {
+router.post('/logo', auth, canManageSettings, upload.single('logo'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
@@ -148,7 +176,7 @@ router.post('/logo', auth, upload.single('logo'), async (req, res) => {
 });
 
 // Delete logo
-router.delete('/logo', auth, async (req, res) => {
+router.delete('/logo', auth, canManageSettings, async (req, res) => {
   try {
     const result = await db.query('SELECT * FROM settings WHERE shop_id = $1', [req.shopId]);
 
@@ -234,12 +262,7 @@ router.put('/lockdown-mode', superAdminMiddleware, async (req, res) => {
 });
 
 // Export tickets without emails as CSV (Admin/SuperAdmin only)
-router.get('/export-no-email-tickets', auth, async (req, res) => {
-  // Allow both admin and superadmin
-  if (req.user.role !== 'admin' && req.user.role !== 'superadmin') {
-    return res.status(403).json({ error: 'Unauthorized' });
-  }
-
+router.get('/export-no-email-tickets', auth, canManageSettings, async (req, res) => {
   try {
     const result = await db.query(`
       SELECT 
@@ -264,17 +287,15 @@ router.get('/export-no-email-tickets', auth, async (req, res) => {
     }
 
     const csvHeader = 'ID,Event,Name,Order ID,Status,Scanned,Created At\n';
-    const csvRows = tickets.map(ticket => {
-      return [
-        ticket.id,
-        ticket.event_name ? `"${ticket.event_name}"` : '',
-        `"${ticket.name}"`,
-        ticket.shopify_order_id || '',
-        ticket.status || 'valid',
-        ticket.scanned,
-        new Date(ticket.created_at).toISOString()
-      ].join(',');
-    }).join('\n');
+    const csvRows = tickets.map(ticket => [
+      ticket.id,
+      ticket.event_name,
+      ticket.name,
+      ticket.shopify_order_id,
+      ticket.status || 'valid',
+      ticket.scanned,
+      new Date(ticket.created_at).toISOString()
+    ].map(csvCell).join(',')).join('\n');
 
     const csv = csvHeader + csvRows;
 

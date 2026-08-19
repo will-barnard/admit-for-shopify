@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { body, validationResult } = require('express-validator');
 const db = require('../config/database');
+const { loginAttemptLimiter } = require('../middleware/rate-limit');
 
 const router = express.Router();
 
@@ -13,6 +14,7 @@ const router = express.Router();
 
 // Login
 router.post('/login',
+  loginAttemptLimiter,
   body('username').trim().notEmpty(),
   body('password').notEmpty(),
   async (req, res) => {
@@ -46,7 +48,9 @@ router.post('/login',
       const token = jwt.sign(
         { id: user.id, username: user.username, role: user.role },
         process.env.JWT_SECRET,
-        { expiresIn: process.env.JWT_EXPIRES_IN }
+        // An unset JWT_EXPIRES_IN passes `expiresIn: undefined`, which jwt.sign
+        // reads as "no expiry" - a stolen admin token would be valid forever.
+        { expiresIn: process.env.JWT_EXPIRES_IN || '12h' }
       );
 
       res.json({ token, user: { id: user.id, username: user.username, role: user.role } });

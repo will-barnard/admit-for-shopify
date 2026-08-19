@@ -1,25 +1,16 @@
-const jwt = require('jsonwebtoken');
+const authMiddleware = require('./auth');
+const requireRole = require('./require-role');
 
-const superAdminMiddleware = (req, res, next) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    
-    if (!token) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    // Check if user has superadmin role
-    if (decoded.role !== 'superadmin') {
-      return res.status(403).json({ error: 'Access denied. SuperAdmin privileges required.' });
-    }
-    
-    req.user = decoded;
-    next();
-  } catch (error) {
-    return res.status(401).json({ error: 'Invalid token' });
-  }
-};
-
-module.exports = superAdminMiddleware;
+/**
+ * Superadmin-only. Exported as a middleware ARRAY so existing call sites keep
+ * working unchanged, whether they use it alone or after authMiddleware:
+ *
+ *   router.get('/x', superAdminMiddleware, handler)
+ *   router.get('/y', authMiddleware, superAdminMiddleware, handler)
+ *
+ * It used to verify the bearer token against JWT_SECRET itself, which meant an
+ * embedded Shopify request - authenticated, but signed with the app's client
+ * secret - was rejected here too. Delegating to authMiddleware fixes both paths
+ * at once.
+ */
+module.exports = [authMiddleware, requireRole('superadmin')];

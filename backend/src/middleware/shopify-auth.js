@@ -2,6 +2,7 @@ const { verifySessionToken, extractSessionToken } = require('../shopify/session-
 const { exchangeToken } = require('../shopify/token-exchange');
 const { isConfigured } = require('../shopify/config');
 const { upsertShop, getShopByDomain } = require('../shopify/shops');
+const { resolveShopifyUser } = require('../shopify/users');
 
 /**
  * Authenticate an embedded-admin request using a Shopify App Bridge session
@@ -39,6 +40,16 @@ async function shopifyAuth(req, res, next) {
   req.shopDomain = verified.shopDomain;
   req.shopifyUserId = verified.userId;
   req.isShopifyRequest = true;
+
+  // Give the request a real identity. Without this, middleware/auth.js would
+  // try to verify this Shopify-signed token against JWT_SECRET and reject it -
+  // the embedded admin would render and then 401 on every call.
+  try {
+    req.user = await resolveShopifyUser(verified.shopDomain, verified.userId);
+  } catch (error) {
+    console.error('Could not resolve a user for the Shopify session:', error.message);
+    return res.status(500).json({ error: 'Could not establish an identity for this Shopify session' });
+  }
 
   // Managed installation means there is no OAuth callback to hang this off, so
   // the first authenticated request is where the offline token gets minted.

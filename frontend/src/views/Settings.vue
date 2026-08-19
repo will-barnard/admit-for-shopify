@@ -46,7 +46,7 @@
                   type="file"
                   ref="logoInput"
                   @change="handleLogoSelect"
-                  accept="image/*"
+                  accept="image/jpeg,image/png,image/gif,image/webp"
                   style="display: none"
                 />
                 <button type="button" @click="$refs.logoInput.click()" class="btn-upload">

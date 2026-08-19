@@ -3,9 +3,10 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const pool = require('../config/database');
+const { loginAttemptLimiter } = require('../middleware/rate-limit');
 
 // Verifier login endpoint
-router.post('/verifier-login', async (req, res) => {
+router.post('/verifier-login', loginAttemptLimiter, async (req, res) => {
   try {
     const { username, password } = req.body;
 
