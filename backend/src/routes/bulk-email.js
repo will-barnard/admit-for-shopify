@@ -3,12 +3,9 @@ const db = require('../config/database');
 const { sendViaResend, getSender } = require('../services/email');
 const authMiddleware = require('../middleware/auth');
 const superAdminMiddleware = require('../middleware/superadmin');
+const emailJobs = require('../services/email-jobs');
 
 const router = express.Router();
-
-// Rate limiting - track last send time per user
-const lastSendTimes = new Map();
-const RATE_LIMIT_MS = 60000; // 1 minute between bulk sends
 
 const isEmailConfigured = Boolean(process.env.RESEND_API_KEY);
 
@@ -93,7 +90,14 @@ router.post('/test', authMiddleware, superAdminMiddleware, async (req, res) => {
   }
 });
 
-// Send bulk email
+// Start a bulk email job.
+//
+// This used to send inline: up to 100 recipients six seconds apart is about ten
+// minutes, against a sixty-second proxy timeout. The caller got a 504 while
+// sending continued unseen, and because the only guard was a sixty-second
+// per-user cooldown, retrying after the timeout sent the entire batch a second
+// time. It now returns as soon as the job is recorded; services/email-jobs.js
+// drains it.
 router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
   try {
     const { subject, body, eventIds, emails, showTicketHolder = true, includeLogo = false } = req.body;
@@ -113,21 +117,23 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
       return res.status(503).json({ error: 'Email service is not configured' });
     }
 
-    // Check rate limit
-    const userId = req.user.id;
-    const lastSendTime = lastSendTimes.get(userId);
-    const now = Date.now();
-
-    if (lastSendTime && (now - lastSendTime) < RATE_LIMIT_MS) {
-      const remainingSeconds = Math.ceil((RATE_LIMIT_MS - (now - lastSendTime)) / 1000);
-      return res.status(429).json({ 
-        error: `Please wait ${remainingSeconds} seconds before sending another bulk email` 
+    // One job at a time per shop. The old per-user cooldown was the only thing
+    // standing between a timed-out request and a duplicate send; an explicit
+    // check against live job state says what is actually true.
+    const active = await db.query(
+      `SELECT id FROM email_jobs WHERE shop_id = $1 AND status IN ('queued', 'running') LIMIT 1`,
+      [req.shopId]
+    );
+    if (active.rows.length > 0) {
+      return res.status(409).json({
+        error: 'A bulk email is already in progress. Wait for it to finish, or cancel it.',
+        jobId: active.rows[0].id,
       });
     }
-    
+
     // Get recipients - either from explicit email list or by event
     let recipients;
-    if (emails && Array.isArray(emails) && emails.length > 0) {
+    if (hasEmails) {
       const placeholders = emails.map((_, i) => `$${i + 2}`).join(', ');
       const result = await db.query(
         `SELECT DISTINCT t.email, t.name, e.name as event_name
@@ -160,36 +166,20 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
     if (recipients.length === 0) {
       return res.status(400).json({ error: 'No valid recipients found for selected events' });
     }
-    
-    // Check daily email limit after getting recipients count
-    const todayStart = new Date();
-    todayStart.setHours(0, 0, 0, 0);
-    
-    const quotaResult = await db.query(
-      'SELECT COUNT(*) as sent_today FROM email_send_log WHERE shop_id = $1 AND sent_at >= $2 AND success = true',
-      [req.shopId, todayStart]
-    );
-    
-    const sentToday = parseInt(quotaResult.rows[0].sent_today);
-    const dailyLimit = 100;
-    const remaining = Math.max(0, dailyLimit - sentToday);
-    
+
+    const remaining = await emailJobs.remainingQuota(req.shopId);
     if (remaining === 0) {
-      return res.status(429).json({ 
-        error: 'Daily email limit of 100 emails reached. Please try again tomorrow.'
+      return res.status(429).json({
+        error: `Daily email limit of ${emailJobs.DAILY_LIMIT} emails reached. Please try again tomorrow.`,
       });
     }
-    
     if (recipients.length > remaining) {
-      return res.status(429).json({ 
-        error: `Cannot send ${recipients.length} emails. Only ${remaining} emails remaining in today's quota of 100.`
+      return res.status(429).json({
+        error: `Cannot send ${recipients.length} emails. Only ${remaining} emails remaining in today's quota of ${emailJobs.DAILY_LIMIT}.`,
       });
     }
 
-    // Update rate limit timestamp
-    lastSendTimes.set(userId, now);
-
-    // Fetch logo URL if requested
+    // Resolve the logo once, now, rather than per message.
     let logoImgUrl = null;
     let orgName = 'Event';
     if (includeLogo) {
@@ -208,73 +198,66 @@ router.post('/send', authMiddleware, superAdminMiddleware, async (req, res) => {
       }
     }
 
-    // Send emails with delay (6 seconds between each = 10 per minute)
-    let sentCount = 0;
-    let failedCount = 0;
-    const errors = [];
+    const job = await emailJobs.createJob({
+      shopId: req.shopId,
+      userId: req.user.id,
+      subject,
+      body,
+      options: { showTicketHolder, logoImgUrl, orgName },
+      recipients,
+    });
 
-    // Preserve line breaks from the textarea
-    const htmlBody = body.replace(/\n/g, '<br>\n');
+    console.log(`Bulk email job ${job.id} queued by ${req.user.username}: ${job.total} recipient(s)`);
 
-    for (const recipient of recipients) {
-      try {
-        const attachments = [];
-
-        await sendViaResend({
-          from: getSender(),
-          to: recipient.email,
-          subject: subject,
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              ${logoImgUrl ? `<div style="text-align: center; padding: 20px 0; background-color: white;"><img src="${logoImgUrl}" alt="${orgName}" style="max-width: 100%; max-height: 150px; object-fit: contain;" /></div>` : ''}
-              ${htmlBody}
-              ${showTicketHolder ? `<div style="margin-top: 30px; padding-top: 20px; border-top: 2px solid #eee; color: #666; font-size: 12px;"><p>Ticket holder: ${recipient.name}</p></div>` : ''}
-            </div>
-          `
-        });
-        
-        // Log successful send
-        await db.query(
-          'INSERT INTO email_send_log (shop_id, recipient_email, send_type, success) VALUES ($1, $2, $3, $4)',
-          [req.shopId, recipient.email, 'bulk_email', true]
-        );
-        
-        sentCount++;
-
-        // 6-second delay between emails (10 per minute)
-        if (sentCount < recipients.length) {
-          await new Promise(resolve => setTimeout(resolve, 6000));
-        }
-      } catch (error) {
-        console.error(`Failed to send to ${recipient.email}:`, error.message);
-        failedCount++;
-        errors.push({ email: recipient.email, error: error.message });
-        
-        // Log failed send
-        try {
-          await db.query(
-            'INSERT INTO email_send_log (shop_id, recipient_email, send_type, success) VALUES ($1, $2, $3, $4)',
-            [req.shopId, recipient.email, 'bulk_email', false]
-          );
-        } catch (logError) {
-          console.error('Failed to log email failure:', logError);
-        }
-      }
-    }
-
-    console.log(`Bulk email by ${req.user.username}: ${sentCount} sent, ${failedCount} failed`);
-
-    res.json({
+    res.status(202).json({
       success: true,
-      message: 'Bulk email sending completed',
-      sent: sentCount,
-      failed: failedCount,
-      total: recipients.length,
-      errors: errors.length > 0 ? errors : undefined
+      message: 'Bulk email queued',
+      jobId: job.id,
+      total: job.total,
+      status: job.status,
     });
   } catch (error) {
-    console.error('Error sending bulk email:', error);
-    res.status(500).json({ error: 'Failed to send bulk email' });
+    console.error('Error queueing bulk email:', error);
+    res.status(500).json({ error: 'Failed to queue bulk email' });
+  }
+});
+
+// Progress for the job list and the progress bar.
+router.get('/jobs', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    res.json({ jobs: await emailJobs.listJobs(req.shopId) });
+  } catch (error) {
+    console.error('Error listing email jobs:', error);
+    res.status(500).json({ error: 'Failed to list email jobs' });
+  }
+});
+
+router.get('/jobs/:id', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const job = await emailJobs.getJob(req.params.id, req.shopId);
+    if (!job) return res.status(404).json({ error: 'Job not found' });
+    res.json({
+      ...job,
+      // 'sending' means the process stopped between Resend accepting the
+      // message and the row being updated. Those are never retried, so report
+      // them rather than pretending they either did or did not arrive.
+      failures: await emailJobs.jobFailures(req.params.id, req.shopId),
+    });
+  } catch (error) {
+    console.error('Error fetching email job:', error);
+    res.status(500).json({ error: 'Failed to fetch email job' });
+  }
+});
+
+router.post('/jobs/:id/cancel', authMiddleware, superAdminMiddleware, async (req, res) => {
+  try {
+    const job = await emailJobs.cancelJob(req.params.id, req.shopId);
+    if (!job) return res.status(404).json({ error: 'No job to cancel' });
+    // Messages already handed to Resend are gone; this only stops the rest.
+    res.json({ message: 'Cancelled', job });
+  } catch (error) {
+    console.error('Error cancelling email job:', error);
+    res.status(500).json({ error: 'Failed to cancel email job' });
   }
 });
 

@@ -156,18 +156,48 @@
         <button 
           @click="confirmSend" 
           class="btn-send"
-          :disabled="!canSendBulk || sending"
+          :disabled="!canSendBulk || sending || jobRunning"
         >
-          {{ sending ? 'Sending...' : 'Send Bulk Email' }}
+          {{ sending ? 'Queueing...' : 'Send Bulk Email' }}
         </button>
 
         <div v-if="sendResult" :class="['result-message', sendResult.type]">
           {{ sendResult.message }}
         </div>
 
-        <div v-if="sending" class="progress-info">
-          <p>⏳ Sending emails... This may take several minutes.</p>
-          <p>Please do not close this page.</p>
+        <!-- Sending happens on the server now, so this is a view of a job
+             rather than a request in flight. Closing the page is fine. -->
+        <div v-if="job" class="progress-info">
+          <div class="progress-head">
+            <strong>{{ statusLabel }}</strong>
+            <span class="progress-count">{{ job.sent }} sent<span v-if="job.failed"> · {{ job.failed }} failed</span> of {{ job.total }}</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-bar" :style="{ width: progressPercent + '%' }"></div>
+          </div>
+          <p class="progress-note">
+            <template v-if="jobRunning">
+              This keeps running on the server - you can close this page and come back.
+            </template>
+            <template v-else-if="job.status === 'completed' && !job.failed">All messages were accepted.</template>
+            <template v-else-if="job.status === 'cancelled'">Cancelled. Messages already handed to Resend were still delivered.</template>
+          </p>
+          <p v-if="job.error_message" class="progress-warning">{{ job.error_message }}</p>
+          <p v-if="Number(job.unknown) > 0" class="progress-warning">
+            {{ job.unknown }} message(s) were interrupted mid-send and were not retried, to avoid
+            delivering twice. Check Resend if you need to know whether they arrived.
+          </p>
+
+          <ul v-if="job.failures && job.failures.length" class="failure-list">
+            <li v-for="f in job.failures" :key="f.email">
+              <strong>{{ f.email }}</strong> — {{ f.error || 'interrupted' }}
+            </li>
+          </ul>
+
+          <div class="progress-actions">
+            <button v-if="jobRunning" @click="cancelJob" class="btn-secondary">Stop sending</button>
+            <button v-else @click="job = null" class="btn-secondary">Dismiss</button>
+          </div>
         </div>
       </div>
     </div>
@@ -194,7 +224,7 @@
 </template>
 
 <script>
-import { ref, computed, onMounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { useAuthStore } from '@/stores/auth';
 import axios from 'axios';
@@ -226,6 +256,13 @@ export default {
     const sending = ref(false);
     const testResult = ref(null);
     const sendResult = ref(null);
+
+    // The job being watched. Sending no longer happens inside the request, so
+    // the page polls rather than waiting: a hundred recipients six seconds
+    // apart used to be ten minutes against a sixty-second proxy timeout, which
+    // meant a guaranteed 504 and no idea what had actually gone out.
+    const job = ref(null);
+    let pollTimer = null;
     const showConfirmModal = ref(false);
 
     const selectedRecipientCount = computed(() => recipients.value.filter(r => r.selected).length);
@@ -312,6 +349,64 @@ export default {
       showConfirmModal.value = true;
     };
 
+    const jobRunning = computed(() => ['queued', 'running'].includes(job.value?.status));
+
+    const statusLabel = computed(() => ({
+      queued: 'Queued',
+      running: 'Sending',
+      completed: 'Finished',
+      cancelled: 'Cancelled',
+      failed: 'Failed',
+    }[job.value?.status] || ''));
+
+    const progressPercent = computed(() => {
+      const total = Number(job.value?.total || 0);
+      if (!total) return 0;
+      return Math.round(((Number(job.value.sent) + Number(job.value.failed)) / total) * 100);
+    });
+
+    const stopPolling = () => {
+      if (pollTimer) clearTimeout(pollTimer);
+      pollTimer = null;
+    };
+
+    const pollJob = async (jobId) => {
+      try {
+        const { data } = await axios.get(`/api/bulk-email/jobs/${jobId}`);
+        job.value = data;
+        if (['queued', 'running'].includes(data.status)) {
+          pollTimer = setTimeout(() => pollJob(jobId), 3000);
+          return;
+        }
+      } catch (err) {
+        console.error('Error polling email job:', err);
+      }
+      stopPolling();
+    };
+
+    const cancelJob = async () => {
+      if (!job.value) return;
+      if (!confirm('Stop sending? Messages already handed to Resend cannot be recalled.')) return;
+      try {
+        await axios.post(`/api/bulk-email/jobs/${job.value.id}/cancel`);
+        await pollJob(job.value.id);
+      } catch (err) {
+        sendResult.value = { type: 'error', message: err.response?.data?.error || 'Could not cancel' };
+      }
+    };
+
+    // If a job is already running - started here, or before a page reload -
+    // pick it back up rather than pretending nothing is happening.
+    const resumeActiveJob = async () => {
+      try {
+        const { data } = await axios.get('/api/bulk-email/jobs');
+        const active = (data.jobs || []).find((j) => ['queued', 'running'].includes(j.status));
+        if (active) await pollJob(active.id);
+      } catch (err) {
+        /* the panel simply stays hidden */
+      }
+    };
+
     const sendBulkEmail = async () => {
       showConfirmModal.value = false;
       sending.value = true;
@@ -329,23 +424,27 @@ export default {
 
         sendResult.value = {
           type: 'success',
-          message: 'Email sent successfully! ' + response.data.sent + ' sent, ' + response.data.failed + ' failed'
+          message: `Queued for ${response.data.total} recipient(s). Sending continues on the server.`
         };
 
-        if (response.data.sent > 0) {
-          subject.value = '';
-          body.value = '';
-          preview.value = null;
-          recipients.value = [];
-          showTicketHolder.value = true;
-          includeLogo.value = false;
-        }
+        subject.value = '';
+        body.value = '';
+        preview.value = null;
+        recipients.value = [];
+        showTicketHolder.value = true;
+        includeLogo.value = false;
+
+        await pollJob(response.data.jobId);
       } catch (error) {
         console.error('Error sending bulk email:', error);
         sendResult.value = {
           type: 'error',
-          message: error.response?.data?.error || 'Failed to send bulk email'
+          message: error.response?.data?.error || 'Failed to queue bulk email'
         };
+        // A 409 names the job already in flight - show that instead of nothing.
+        if (error.response?.status === 409 && error.response.data?.jobId) {
+          await pollJob(error.response.data.jobId);
+        }
       } finally {
         sending.value = false;
       }
@@ -362,7 +461,10 @@ export default {
 
     onMounted(() => {
       loadEvents();
+      resumeActiveJob();
     });
+
+    onUnmounted(stopPolling);
 
     return {
       authStore,
@@ -380,6 +482,11 @@ export default {
       sending,
       testResult,
       sendResult,
+      job,
+      jobRunning,
+      statusLabel,
+      progressPercent,
+      cancelJob,
       showConfirmModal,
       showTicketHolder,
       includeLogo,
@@ -829,4 +936,13 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   .recipient-row { grid-template-columns: auto 1fr 1fr; }
   .recipient-event { display: none; }
 }
+
+.progress-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 8px; }
+.progress-count { font-size: 13px; color: #555; }
+.progress-track { height: 8px; background: #e6e8f0; border-radius: 4px; overflow: hidden; }
+.progress-bar { height: 100%; background: #667eea; transition: width 0.4s ease; }
+.progress-note { font-size: 13px; color: #666; margin: 8px 0 0; }
+.progress-warning { font-size: 13px; color: #8a5a00; background: #fff6e5; border: 1px solid #ffe0a3; border-radius: 6px; padding: 8px 10px; margin: 8px 0 0; }
+.failure-list { margin: 10px 0 0; padding-left: 18px; font-size: 13px; color: #c33; max-height: 180px; overflow-y: auto; }
+.progress-actions { margin-top: 12px; }
 </style>

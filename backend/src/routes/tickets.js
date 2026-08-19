@@ -13,46 +13,58 @@ const router = express.Router();
 // Get all tickets (protected)
 router.get('/', authMiddleware, async (req, res) => {
   try {
+    // This used to fetch every ticket and every scan, then run
+    // scans.filter(...) once per ticket - O(tickets x scans) in JavaScript, on
+    // every load of the tickets page. A LATERAL join asks the database for the
+    // first scan per ticket instead, which is one indexed lookup each.
+    //
+    // The earliest scan is now the one reported. The old code took whichever
+    // row the filter happened to yield first, with no ORDER BY, so "scanned on"
+    // could change between requests for a re-scanned ticket.
     const ticketsResult = await db.query(
-      `SELECT t.id, t.event_id, t.ticket_type_id, t.name, t.email, t.uuid, t.is_used, t.email_sent, t.status, t.shopify_order_id, t.created_at,
+      `SELECT t.id, t.event_id, t.ticket_type_id, t.name, t.email, t.uuid, t.is_used,
+              t.email_sent, t.status, t.shopify_order_id, t.created_at,
               e.name as event_name,
               e.archived as event_archived,
-              tt.name as ticket_type_name
+              tt.name as ticket_type_name,
+              s.scan_date, s.scanned_by_user_id, s.scanned_by_username
        FROM tickets t
        LEFT JOIN events e ON t.event_id = e.id AND e.shop_id = t.shop_id
        LEFT JOIN event_ticket_types tt ON tt.id = t.ticket_type_id AND tt.shop_id = t.shop_id
+       LEFT JOIN LATERAL (
+         SELECT ts.scan_date, ts.scanned_by_user_id, u.username AS scanned_by_username
+           FROM ticket_scans ts
+           LEFT JOIN users u ON ts.scanned_by_user_id = u.id
+          WHERE ts.ticket_id = t.id AND ts.shop_id = t.shop_id
+          ORDER BY ts.scan_date, ts.id
+          LIMIT 1
+       ) s ON TRUE
        WHERE t.shop_id = $1
        ORDER BY t.created_at DESC`,
       [req.shopId]
     );
-    
-    // Get all scans with scanner user info
-    const scansResult = await db.query(
-      `SELECT ts.ticket_id, ts.scan_date, ts.scanned_by_user_id,
-              u.username as scanned_by_username
-       FROM ticket_scans ts
-       LEFT JOIN users u ON ts.scanned_by_user_id = u.id
-       WHERE ts.shop_id = $1`,
+
+    const checkInsResult = await db.query(
+      'SELECT COUNT(*)::int AS total FROM ticket_scans WHERE shop_id = $1',
       [req.shopId]
     );
-    
-    const tickets = ticketsResult.rows.map(ticket => {
-      const ticketScans = scansResult.rows.filter(s => s.ticket_id === ticket.id);
-      const scans = {
-        scanned: ticketScans.length > 0,
-        scannedOn: ticketScans.length > 0 ? ticketScans[0].scan_date : null,
-        scannedBy: ticketScans.length > 0 ? {
-          userId: ticketScans[0].scanned_by_user_id,
-          username: ticketScans[0].scanned_by_username
-        } : null
+
+    const tickets = ticketsResult.rows.map((row) => {
+      const { scan_date, scanned_by_user_id, scanned_by_username, ...ticket } = row;
+      return {
+        ...ticket,
+        scans: {
+          scanned: scan_date !== null,
+          scannedOn: scan_date,
+          scannedBy: scan_date === null ? null : {
+            userId: scanned_by_user_id,
+            username: scanned_by_username,
+          },
+        },
       };
-      
-      return { ...ticket, scans };
     });
-    
-    const totalCheckIns = scansResult.rows.length;
-    
-    res.json({ tickets, totalCheckIns });
+
+    res.json({ tickets, totalCheckIns: checkInsResult.rows[0].total });
   } catch (error) {
     console.error('Error fetching tickets:', error);
     res.status(500).json({ error: 'Server error' });

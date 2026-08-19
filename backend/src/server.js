@@ -21,6 +21,7 @@ const shopContext = require('./middleware/shop-context');
 const shopifyAuth = require('./middleware/shopify-auth');
 const shopifyWebhookRoutes = require('./routes/shopify-webhooks');
 const { authRouteLimiter } = require('./middleware/rate-limit');
+const emailJobs = require('./services/email-jobs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -82,4 +83,8 @@ app.get('/health', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+
+  // Drains bulk email jobs, and requeues any left mid-flight by a restart.
+  // Started after listen so a slow database cannot delay accepting requests.
+  emailJobs.startWorker();
 });

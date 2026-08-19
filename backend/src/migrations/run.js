@@ -492,6 +492,72 @@ async function runMigrations() {
     `);
     console.log('\u2713 webhook_logs.unmatched_line_items ensured');
 
+    // ------------------------------------------------------------------
+    // Bulk email jobs
+    //
+    // Sending used to happen inside the HTTP request: up to 100 recipients,
+    // six seconds apart, is ten minutes against a sixty-second proxy timeout.
+    // The operator saw a 504 while sending carried on invisibly, and a restart
+    // lost the remainder with no record of who had been reached.
+    //
+    // The recipient list is materialised up front so a job is resumable and
+    // each address can only be sent once. See services/email-jobs.js.
+    // ------------------------------------------------------------------
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS email_jobs (
+        id SERIAL PRIMARY KEY,
+        shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+        created_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+        subject TEXT NOT NULL,
+        body TEXT NOT NULL,
+        options JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status VARCHAR(20) NOT NULL DEFAULT 'queued',
+        total INTEGER NOT NULL DEFAULT 0,
+        sent INTEGER NOT NULL DEFAULT 0,
+        failed INTEGER NOT NULL DEFAULT 0,
+        error_message TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        started_at TIMESTAMP,
+        finished_at TIMESTAMP,
+        CONSTRAINT valid_email_job_status
+          CHECK (status IN ('queued', 'running', 'completed', 'cancelled', 'failed'))
+      )
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS email_job_recipients (
+        id SERIAL PRIMARY KEY,
+        job_id INTEGER NOT NULL REFERENCES email_jobs(id) ON DELETE CASCADE,
+        shop_id INTEGER NOT NULL REFERENCES shops(id) ON DELETE CASCADE,
+        email VARCHAR(255) NOT NULL,
+        name VARCHAR(255),
+        status VARCHAR(20) NOT NULL DEFAULT 'pending',
+        error TEXT,
+        sent_at TIMESTAMP,
+        CONSTRAINT valid_recipient_status
+          CHECK (status IN ('pending', 'sending', 'sent', 'failed', 'skipped'))
+      )
+    `);
+
+    // One row per address per job: a retry can never double up.
+    await db.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_email_job_recipients_unique
+        ON email_job_recipients (job_id, lower(email))
+    `);
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_email_job_recipients_pending
+        ON email_job_recipients (job_id) WHERE status = 'pending'
+    `);
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_email_jobs_shop
+        ON email_jobs (shop_id, created_at DESC)
+    `);
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_email_jobs_claimable
+        ON email_jobs (id) WHERE status IN ('queued', 'running')
+    `);
+    console.log('\u2713 Email job tables created');
+
     console.log('Migrations completed successfully!');
     process.exit(0);
   } catch (error) {
