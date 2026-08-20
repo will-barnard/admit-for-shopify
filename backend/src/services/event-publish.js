@@ -30,6 +30,29 @@ const { forShop, assertNoUserErrors, gid } = require('../shopify/admin-api');
 const NAMESPACE = 'admit';
 const OPTION_NAME = 'Ticket';
 
+const PRIMARY_LOCATION_QUERY = `
+  query AdmitPrimaryLocation {
+    location { id name }
+  }
+`;
+
+/**
+ * Where stock is held. Tickets are not really stocked anywhere, but Shopify
+ * needs a location to hold a number against, and the shop's default is the one
+ * every store has.
+ */
+async function primaryLocationId(shopId) {
+  try {
+    const data = await forShop(shopId, PRIMARY_LOCATION_QUERY, {});
+    return data?.location?.id || null;
+  } catch (error) {
+    // Not fatal: without it the variant is still tracked, it just starts at
+    // zero available and the count is set in Shopify.
+    console.warn('Could not read the primary location, publishing without an opening stock level:', error.message);
+    return null;
+  }
+}
+
 const PUBLISH_MUTATION = `
   mutation AdmitPublishEvent($input: ProductSetInput!, $identifier: ProductSetIdentifiers) {
     productSet(input: $input, identifier: $identifier, synchronous: true) {
@@ -72,7 +95,7 @@ function metafieldsFor(event) {
  * @param {Array} ticketTypes  every type the event has, in display order
  * @param {object} options     { collectionIds, status }
  */
-function buildProductInput(event, ticketTypes, { collectionIds = [], status } = {}) {
+function buildProductInput(event, ticketTypes, { collectionIds = [], status, locationId = null } = {}) {
   const sellable = ticketTypes.filter((t) => t.active !== false);
   if (sellable.length === 0) {
     throw new Error('An event needs at least one active ticket type before it can be published.');
@@ -89,10 +112,11 @@ function buildProductInput(event, ticketTypes, { collectionIds = [], status } = 
       optionValues: [{ optionName: OPTION_NAME, name }],
       price: t.price == null ? '0.00' : String(t.price),
       position: index + 1,
-      // A ticket is not shipped, and capacity here is the app's business, not
-      // Shopify's - tracking inventory in two places is how they drift.
-      inventoryItem: { tracked: false, requiresShipping: false },
-      inventoryPolicy: 'CONTINUE',
+      // Shopify owns the count. It tracks stock and REFUSES to sell past it, so
+      // a sold-out show stops selling at the checkout rather than after the
+      // fact - the app finding out from a webhook is always too late.
+      inventoryItem: { tracked: true, requiresShipping: false },
+      inventoryPolicy: 'DENY',
       taxable: true,
       metafields: [
         { namespace: NAMESPACE, key: 'ticket_type_id', type: 'single_line_text_field', value: String(t.id) },
@@ -102,6 +126,18 @@ function buildProductInput(event, ticketTypes, { collectionIds = [], status } = 
     // rather than replaces - replacing would orphan tickets already sold.
     if (t.shopify_variant_id) variant.id = `gid://shopify/ProductVariant/${t.shopify_variant_id}`;
     if (t.shopify_sku) variant.sku = t.shopify_sku;
+
+    // Stock is seeded ONCE, when the variant is first created. Re-publishing
+    // must not resend it: Shopify decrements as tickets sell, so setting it
+    // again would silently restore the count and let the show oversell. After
+    // the first publish the number in Shopify is the live one, and that is
+    // where it gets changed.
+    const isNew = !t.shopify_variant_id;
+    if (isNew && t.capacity != null && locationId) {
+      variant.inventoryQuantities = [
+        { locationId, name: 'available', quantity: Number(t.capacity) },
+      ];
+    }
     return variant;
   });
 
@@ -164,7 +200,11 @@ async function publishEvent(shopId, eventId, { collectionIds = [], status } = {}
   if (!loaded) return null;
   const { event, ticketTypes } = loaded;
 
-  const input = buildProductInput(event, ticketTypes, { collectionIds, status });
+  // Only needed when there is a new variant to seed.
+  const needsLocation = ticketTypes.some((t) => t.active !== false && !t.shopify_variant_id && t.capacity != null);
+  const locationId = needsLocation ? await primaryLocationId(shopId) : null;
+
+  const input = buildProductInput(event, ticketTypes, { collectionIds, status, locationId });
 
   let data;
   try {

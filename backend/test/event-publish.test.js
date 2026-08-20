@@ -76,6 +76,10 @@ adminApi.setTransport(async (url, body, headers) => {
   calls.push({ url, body, headers });
   if (respondWith) { const r = respondWith; respondWith = null; return r; }
 
+  if (/AdmitPrimaryLocation/.test(body.query)) {
+    return { status: 200, data: { data: { location: { id: 'gid://shopify/Location/7', name: 'Shop' } } } };
+  }
+
   const input = body.variables.input;
   const eventId = body.variables.identifier?.customId?.value;
 
@@ -173,10 +177,10 @@ adminApi.setTransport(async (url, body, headers) => {
     sent.input.productOptions[0].name === 'Ticket', JSON.stringify(sent.input.productOptions));
   check('prices are carried up', sent.input.variants.map((v) => v.price).join(',') === '95.00,45.00,0.00',
     sent.input.variants.map((v) => v.price).join(','));
-  check('inventory is NOT tracked in Shopify (capacity lives here)',
-    sent.input.variants.every((v) => v.inventoryItem.tracked === false));
-  check('  ...and selling is not blocked by Shopify stock',
-    sent.input.variants.every((v) => v.inventoryPolicy === 'CONTINUE'));
+  check('Shopify tracks the stock',
+    sent.input.variants.every((v) => v.inventoryItem.tracked === true));
+  check('  ...and REFUSES to sell past it, so a sold-out show stops selling',
+    sent.input.variants.every((v) => v.inventoryPolicy === 'DENY'));
   check('tickets are not shippable',
     sent.input.variants.every((v) => v.inventoryItem.requiresShipping === false));
 
@@ -331,6 +335,47 @@ adminApi.setTransport(async (url, body, headers) => {
   shopContextModule.clearShopCache();
   r = await api(`/api/events/${event.id}/publish`, { method: 'POST', shopDomain: 'other.myshopify.com' });
   check('another shop cannot publish this event', r.status === 404, `${r.status} ${r.raw}`);
+
+  // -------------------------------------------------------------------------
+  console.log('\n9. stock is seeded once and then belongs to Shopify');
+
+  r = await api('/api/events', {
+    method: 'POST',
+    body: {
+      name: 'Capped Show',
+      starts_at: '2027-03-01 19:00',
+      ticket_types: [
+        { name: 'Floor', price: '30.00', capacity: 120 },
+        { name: 'Balcony', price: '20.00' },
+      ],
+    },
+  });
+  const capped = r.body;
+  r = await api(`/api/events/${capped.id}/publish`, { method: 'POST' });
+  check('a capped event publishes', r.status === 200, `${r.status} ${r.raw}`);
+
+  const firstVariants = calls[calls.length - 1].body.variables.input.variants;
+  const floor = firstVariants.find((v) => v.optionValues[0].name === 'Floor');
+  const balcony = firstVariants.find((v) => v.optionValues[0].name === 'Balcony');
+  check('capacity becomes the opening stock level',
+    floor.inventoryQuantities?.[0]?.quantity === 120, JSON.stringify(floor.inventoryQuantities));
+  check('  ...as available, at the shop location',
+    floor.inventoryQuantities[0].name === 'available'
+      && floor.inventoryQuantities[0].locationId === 'gid://shopify/Location/7',
+    JSON.stringify(floor.inventoryQuantities[0]));
+  check('a type with no capacity is tracked but not seeded',
+    balcony.inventoryQuantities === undefined && balcony.inventoryItem.tracked === true,
+    JSON.stringify(balcony.inventoryQuantities));
+
+  // The one that would quietly cause overselling.
+  r = await api(`/api/events/${capped.id}/publish`, { method: 'POST' });
+  check('re-publishing succeeds', r.status === 200, `${r.status} ${r.raw}`);
+  const secondVariants = calls[calls.length - 1].body.variables.input.variants;
+  check('re-publishing does NOT resend the stock level',
+    secondVariants.every((v) => v.inventoryQuantities === undefined),
+    JSON.stringify(secondVariants.map((v) => v.inventoryQuantities)));
+  check('  ...because Shopify has been decrementing it as tickets sold',
+    secondVariants.every((v) => v.inventoryItem.tracked === true && v.inventoryPolicy === 'DENY'));
 
   console.log(`\n${pass} passed, ${fail} failed`);
   server.close();
