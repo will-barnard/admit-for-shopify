@@ -7,10 +7,17 @@
  * in from what Shopify returns, and the order-matching pipeline downstream is
  * unchanged: it still matches a line item on variant id, then SKU.
  *
- * Identity is an `admit.event_id` metafield, not the stored product id.
- * productSet upserts on it, so re-publishing is idempotent even if
- * events.shopify_product_id is empty or stale, and two clicks of Publish cannot
- * produce two products.
+ * Identity is the product HANDLE, derived from the event id, with the stored
+ * product id preferred when we have one. Two clicks of Publish cannot produce
+ * two products.
+ *
+ * It was originally the `admit.event_id` metafield via productSet's `customId`,
+ * which reads better - but the real API refuses it with METAFIELD_MISMATCH even
+ * when the metafield is present with a matching value and a unique-values
+ * definition exists. The stubbed test could not see that, because the stub
+ * implemented the contract as documented rather than as built. A handle needs
+ * no definition, no uniqueness capability, and no app-reserved-namespace
+ * resolution, so it is the sturdier choice anyway.
  *
  * productSet is DECLARATIVE: variants absent from the input are removed. That
  * is what makes it the right call - the event is the source of truth and the
@@ -26,6 +33,7 @@
 
 const db = require('../config/database');
 const { forShop, assertNoUserErrors, gid } = require('../shopify/admin-api');
+const { ensureDefinitions } = require('../shopify/metafield-definitions');
 
 const NAMESPACE = 'admit';
 const OPTION_NAME = 'Ticket';
@@ -53,6 +61,42 @@ async function primaryLocationId(shopId) {
   }
 }
 
+const ONLINE_STORE_QUERY = `
+  query AdmitOnlineStore {
+    publications(first: 20, catalogType: APP) { nodes { id name } }
+  }
+`;
+
+const PUBLISH_TO_CHANNEL = `
+  mutation AdmitPublishToChannel($id: ID!, $input: [PublicationInput!]!) {
+    publishablePublish(id: $id, input: $input) {
+      publishable { ... on Product { id onlineStoreUrl } }
+      userErrors { field message }
+    }
+  }
+`;
+
+/**
+ * productSet creates the product but does NOT put it on any sales channel, so a
+ * "published" event came back with onlineStoreUrl null and was invisible on the
+ * storefront - correct product, correct variants, nobody could buy it. Found
+ * against the real API; the stub had no concept of channels.
+ */
+async function publishToOnlineStore(shopId, productGid) {
+  const pubs = await forShop(shopId, ONLINE_STORE_QUERY, {});
+  const onlineStore = (pubs?.publications?.nodes || []).find((n) => n.name === 'Online Store');
+  if (!onlineStore) {
+    console.warn('No Online Store publication found - the product will not be visible on the storefront.');
+    return null;
+  }
+  const result = await forShop(shopId, PUBLISH_TO_CHANNEL, {
+    id: productGid,
+    input: [{ publicationId: onlineStore.id }],
+  });
+  assertNoUserErrors(result?.publishablePublish, 'Putting the event on the Online Store');
+  return result.publishablePublish.publishable?.onlineStoreUrl || null;
+}
+
 const PUBLISH_MUTATION = `
   mutation AdmitPublishEvent($input: ProductSetInput!, $identifier: ProductSetIdentifiers) {
     productSet(input: $input, identifier: $identifier, synchronous: true) {
@@ -69,6 +113,11 @@ const PUBLISH_MUTATION = `
     }
   }
 `;
+
+/** Deterministic, so the upsert finds the same product every time. */
+function handleFor(event) {
+  return `admit-event-${event.id}`;
+}
 
 /** Naive local timestamps, formatted the way a metafield of type date_time wants. */
 function isoish(value) {
@@ -142,11 +191,16 @@ function buildProductInput(event, ticketTypes, { collectionIds = [], status, loc
   });
 
   return {
+    handle: handleFor(event),
     title: event.name,
     descriptionHtml: event.description || '',
     status: status || (event.active === false ? 'DRAFT' : 'ACTIVE'),
     productType: 'Event Ticket',
-    tags: ['admit-event'],
+    // 'event' is what puts the product in the store's Events collection - it is
+    // a smart collection with the rule TAG EQUALS "event", so this tag is the
+    // membership. 'admit-event' is just so app-made products are easy to pick
+    // out in the admin; identity for upserting is the metafield, not a tag.
+    tags: ['event', 'admit-event'],
     productOptions: [{
       name: OPTION_NAME,
       position: 1,
@@ -200,6 +254,10 @@ async function publishEvent(shopId, eventId, { collectionIds = [], status } = {}
   if (!loaded) return null;
   const { event, ticketTypes } = loaded;
 
+  // Without these, the metafields are written but the theme cannot read them,
+  // so every event would render with no date and nothing would say why.
+  await ensureDefinitions(shopId);
+
   // Only needed when there is a new variant to seed.
   const needsLocation = ticketTypes.some((t) => t.active !== false && !t.shopify_variant_id && t.capacity != null);
   const locationId = needsLocation ? await primaryLocationId(shopId) : null;
@@ -210,8 +268,10 @@ async function publishEvent(shopId, eventId, { collectionIds = [], status } = {}
   try {
     data = await forShop(shopId, PUBLISH_MUTATION, {
       input,
-      // Upsert on the event id, so this is safe to run twice.
-      identifier: { customId: { namespace: NAMESPACE, key: 'event_id', value: String(event.id) } },
+      // Prefer the id we already hold; fall back to the deterministic handle.
+      identifier: event.shopify_product_id
+        ? { id: `gid://shopify/Product/${event.shopify_product_id}` }
+        : { handle: handleFor(event) },
     });
     assertNoUserErrors(data?.productSet, 'Publishing the event');
   } catch (error) {
@@ -225,6 +285,22 @@ async function publishEvent(shopId, eventId, { collectionIds = [], status } = {}
   const product = data.productSet.product;
   const variantNodes = product?.variants?.nodes || [];
   const mapped = await recordVariantIds(shopId, ticketTypes, variantNodes);
+
+  // Creating it is not the same as putting it on sale.
+  let onlineStoreUrl = product.onlineStoreUrl || null;
+  if (!onlineStoreUrl && (status || 'ACTIVE') !== 'DRAFT') {
+    try {
+      onlineStoreUrl = await publishToOnlineStore(shopId, product.id);
+    } catch (error) {
+      // The product exists and is correct; it is just not on the storefront
+      // yet. Say so rather than failing the whole publish.
+      console.error('Could not put the event on the Online Store:', error.message);
+      await db.query(
+        'UPDATE events SET publish_error = $1 WHERE id = $2 AND shop_id = $3',
+        [`Created, but not added to the Online Store: ${error.message}`, eventId, shopId]
+      );
+    }
+  }
 
   const saved = await db.query(
     `UPDATE events
@@ -241,7 +317,7 @@ async function publishEvent(shopId, eventId, { collectionIds = [], status } = {}
       id: gid.toNumeric(product.id),
       handle: product.handle,
       status: product.status,
-      onlineStoreUrl: product.onlineStoreUrl || null,
+      onlineStoreUrl,
     },
     mappedVariants: mapped,
   };
@@ -261,7 +337,9 @@ async function unpublishEvent(shopId, eventId) {
   const input = buildProductInput(event, ticketTypes, { status: 'DRAFT' });
   const data = await forShop(shopId, PUBLISH_MUTATION, {
     input,
-    identifier: { customId: { namespace: NAMESPACE, key: 'event_id', value: String(event.id) } },
+    identifier: event.shopify_product_id
+      ? { id: `gid://shopify/Product/${event.shopify_product_id}` }
+      : { handle: handleFor(event) },
   });
   assertNoUserErrors(data?.productSet, 'Unpublishing the event');
 
@@ -274,6 +352,7 @@ async function unpublishEvent(shopId, eventId) {
 
 module.exports = {
   publishEvent,
+  handleFor,
   unpublishEvent,
   buildProductInput,
   metafieldsFor,

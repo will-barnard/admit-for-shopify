@@ -71,22 +71,58 @@ const store = new Map(); // eventId -> { id, handle, variants: [{id,title,sku,pr
 let nextProductId = 900;
 let nextVariantId = 8000;
 let respondWith = null; // override for a single call
+const definedKeys = [];
+const channelPublishes = [];
+
+// A publish now makes several calls - definitions, location, productSet,
+// channel - so "the last call" is no longer the one under test.
+const lastProductSet = () => [...calls].reverse().find((c) => /AdmitPublishEvent/.test(c.body.query));
 
 adminApi.setTransport(async (url, body, headers) => {
   calls.push({ url, body, headers });
-  if (respondWith) { const r = respondWith; respondWith = null; return r; }
+  if (respondWith && /AdmitPublishEvent/.test(body.query)) {
+    const r = respondWith; respondWith = null; return r;
+  }
 
   if (/AdmitPrimaryLocation/.test(body.query)) {
     return { status: 200, data: { data: { location: { id: 'gid://shopify/Location/7', name: 'Shop' } } } };
   }
+  if (/AdmitDefineMetafield/.test(body.query)) {
+    definedKeys.push(body.variables.definition.key);
+    return { status: 200, data: { data: { metafieldDefinitionCreate: {
+      createdDefinition: { id: 'gid://shopify/MetafieldDefinition/1', key: body.variables.definition.key },
+      userErrors: [],
+    } } } };
+  }
+  if (/AdmitOnlineStore/.test(body.query)) {
+    return { status: 200, data: { data: { publications: { nodes: [
+      { id: 'gid://shopify/Publication/1', name: 'Online Store' },
+      { id: 'gid://shopify/Publication/2', name: 'Point of Sale' },
+    ] } } } };
+  }
+  if (/AdmitPublishToChannel/.test(body.query)) {
+    channelPublishes.push(body.variables);
+    const p = [...store.values()].find((x) => x.id === body.variables.id);
+    if (p) p.onlineStoreUrl = `https://pub-shop.myshopify.com/products/${p.handle}`;
+    return { status: 200, data: { data: { publishablePublish: {
+      publishable: { id: body.variables.id, onlineStoreUrl: p ? p.onlineStoreUrl : null },
+      userErrors: [],
+    } } } };
+  }
 
   const input = body.variables.input;
-  const eventId = body.variables.identifier?.customId?.value;
+  const ident = body.variables.identifier || {};
 
-  let product = store.get(eventId);
+  // Upsert the way the real mutation does: by id when given, otherwise by
+  // handle. Keyed by handle, because that is the identity now.
+  let product = ident.id
+    ? [...store.values()].find((p) => p.id === ident.id)
+    : store.get(ident.handle);
+
   if (!product) {
-    product = { id: `gid://shopify/Product/${nextProductId += 1}`, handle: `event-${eventId}`, variants: [] };
-    store.set(eventId, product);
+    const handle = ident.handle || input.handle;
+    product = { id: `gid://shopify/Product/${nextProductId += 1}`, handle, variants: [], onlineStoreUrl: null };
+    store.set(handle, product);
   }
   product.status = input.status;
 
@@ -111,7 +147,10 @@ adminApi.setTransport(async (url, body, headers) => {
             id: product.id,
             handle: product.handle,
             status: product.status,
-            onlineStoreUrl: `https://pub-shop.myshopify.com/products/${product.handle}`,
+            // productSet does not put a product on any sales channel. The real
+            // API returns null here, and a "published" event was invisible on
+            // the storefront because of it.
+            onlineStoreUrl: product.onlineStoreUrl || null,
             variants: { nodes: product.variants },
           },
           userErrors: [],
@@ -170,7 +209,7 @@ adminApi.setTransport(async (url, body, headers) => {
   check('  ...and the storefront URL', /products\//.test(r.body.product?.onlineStoreUrl || ''),
     r.body.product?.onlineStoreUrl);
 
-  const sent = calls[calls.length - 1].body.variables;
+  const sent = lastProductSet().body.variables;
   check('one variant per ticket type', sent.input.variants.length === 3,
     String(sent.input.variants.length));
   check('the option is named per ticket, not "Title"',
@@ -192,10 +231,10 @@ adminApi.setTransport(async (url, body, headers) => {
   check('the metafield types are declared', sent.input.metafields.every((m) => Boolean(m.type)));
 
   check('the request went to the right shop and version',
-    calls[calls.length - 1].url === 'https://pub-shop.myshopify.com/admin/api/2026-07/graphql.json',
-    calls[calls.length - 1].url);
+    lastProductSet().url === 'https://pub-shop.myshopify.com/admin/api/2026-07/graphql.json',
+    lastProductSet().url);
   check('  ...with the stored access token',
-    calls[calls.length - 1].headers['X-Shopify-Access-Token'] === 'shpat_test');
+    lastProductSet().headers['X-Shopify-Access-Token'] === 'shpat_test');
 
   // -------------------------------------------------------------------------
   console.log('\n2. the variant ids come back to the ticket types');
@@ -235,16 +274,20 @@ adminApi.setTransport(async (url, body, headers) => {
   check('  ...leaving the variant ids untouched',
     JSON.stringify(typesAfter) === JSON.stringify(types), JSON.stringify(typesAfter));
 
-  const identifier = calls[calls.length - 1].body.variables.identifier;
-  check('identity is the event id, not the stored product id',
-    identifier.customId.key === 'event_id' && identifier.customId.value === String(event.id),
+  const identifier = lastProductSet().body.variables.identifier;
+  check('identity is the product we already know about',
+    identifier.id === store.get(`admit-event-${event.id}`).id
+      || identifier.handle === `admit-event-${event.id}`,
     JSON.stringify(identifier));
 
   // Even with the local product id wiped, the upsert still finds it.
   await db.query('UPDATE events SET shopify_product_id = NULL WHERE id = $1', [event.id]);
   r = await api(`/api/events/${event.id}/publish`, { method: 'POST' });
-  check('a stale/blank product id does not fork a new product',
+  check('a blank product id falls back to the handle, not a new product',
     r.status === 200 && store.size === productsBefore, `${r.status} ${store.size}`);
+  check('  ...via a deterministic handle',
+    lastProductSet().body.variables.identifier.handle === `admit-event-${event.id}`,
+    JSON.stringify(lastProductSet().body.variables.identifier));
 
   // -------------------------------------------------------------------------
   console.log('\n4. renaming a ticket type edits its variant');
@@ -261,7 +304,7 @@ adminApi.setTransport(async (url, body, headers) => {
   r = await api(`/api/events/${event.id}/publish`, { method: 'POST' });
   check('re-publishing after a rename succeeds', r.status === 200, `${r.status} ${r.raw}`);
 
-  const renamedSent = calls[calls.length - 1].body.variables.input.variants;
+  const renamedSent = lastProductSet().body.variables.input.variants;
   const renamed = renamedSent.find((v) => v.optionValues[0].name === 'VIP Weekend');
   check('the existing variant id is sent, so Shopify edits rather than replaces',
     renamed?.id === `gid://shopify/ProductVariant/${vipVariantId}`, JSON.stringify(renamed?.id));
@@ -290,10 +333,11 @@ adminApi.setTransport(async (url, body, headers) => {
     failed.publish_error);
 
   respondWith = { status: 200, data: { errors: [{ message: 'Throttled', extensions: { code: 'THROTTLED' } }] } };
-  const callsBefore = calls.length;
+  const setsBefore = calls.filter((c) => /AdmitPublishEvent/.test(c.body.query)).length;
   r = await api(`/api/events/${event.id}/publish`, { method: 'POST' });
-  check('a throttled call is retried, not failed outright', calls.length > callsBefore + 1,
-    `${calls.length - callsBefore} attempts`);
+  const setsAfter = calls.filter((c) => /AdmitPublishEvent/.test(c.body.query)).length;
+  check('a throttled call is retried, not failed outright', setsAfter > setsBefore + 1,
+    `${setsAfter - setsBefore} attempts`);
   check('  ...and succeeds once the throttle clears', r.status === 200, `${r.status} ${r.raw}`);
 
   // -------------------------------------------------------------------------
@@ -319,8 +363,8 @@ adminApi.setTransport(async (url, body, headers) => {
   check('unpublish succeeds', r.status === 200, `${r.status} ${r.raw}`);
   check('  ...by drafting the product', r.body.product?.status === 'DRAFT', JSON.stringify(r.body.product));
   check('  ...and the product still exists, with its order history',
-    store.has(String(event.id)) && store.get(String(event.id)).variants.length > 0,
-    JSON.stringify(store.get(String(event.id))?.variants?.length));
+    store.has(`admit-event-${event.id}`) && store.get(`admit-event-${event.id}`).variants.length > 0,
+    JSON.stringify(store.get(`admit-event-${event.id}`)?.variants?.length));
   const unpublished = (await q('SELECT published_at, shopify_product_id FROM events WHERE id = $1', [event.id]))[0];
   check('  ...while the event reads as unpublished', unpublished.published_at === null,
     String(unpublished.published_at));
@@ -354,7 +398,7 @@ adminApi.setTransport(async (url, body, headers) => {
   r = await api(`/api/events/${capped.id}/publish`, { method: 'POST' });
   check('a capped event publishes', r.status === 200, `${r.status} ${r.raw}`);
 
-  const firstVariants = calls[calls.length - 1].body.variables.input.variants;
+  const firstVariants = lastProductSet().body.variables.input.variants;
   const floor = firstVariants.find((v) => v.optionValues[0].name === 'Floor');
   const balcony = firstVariants.find((v) => v.optionValues[0].name === 'Balcony');
   check('capacity becomes the opening stock level',
@@ -370,12 +414,48 @@ adminApi.setTransport(async (url, body, headers) => {
   // The one that would quietly cause overselling.
   r = await api(`/api/events/${capped.id}/publish`, { method: 'POST' });
   check('re-publishing succeeds', r.status === 200, `${r.status} ${r.raw}`);
-  const secondVariants = calls[calls.length - 1].body.variables.input.variants;
+  const secondVariants = lastProductSet().body.variables.input.variants;
   check('re-publishing does NOT resend the stock level',
     secondVariants.every((v) => v.inventoryQuantities === undefined),
     JSON.stringify(secondVariants.map((v) => v.inventoryQuantities)));
   check('  ...because Shopify has been decrementing it as tickets sold',
     secondVariants.every((v) => v.inventoryItem.tracked === true && v.inventoryPolicy === 'DENY'));
+
+  // -------------------------------------------------------------------------
+  console.log('\n10. the things only the real API showed');
+
+  // Creating the product is not the same as putting it on sale. productSet
+  // leaves it off every sales channel, so the first "successful" publish
+  // against the real store produced a correct, invisible product.
+  check('the event is pushed to the Online Store channel', channelPublishes.length > 0,
+    String(channelPublishes.length));
+  check('  ...naming the Online Store publication specifically',
+    channelPublishes[0].input[0].publicationId === 'gid://shopify/Publication/1',
+    JSON.stringify(channelPublishes[0].input));
+
+  const freshEvent = await api('/api/events', { method: 'POST', body: {
+    name: 'Channel check', starts_at: '2027-05-05 20:00',
+    ticket_types: [{ name: 'Entry', price: '10.00' }],
+  } });
+  const beforePublishes = channelPublishes.length;
+  r = await api(`/api/events/${freshEvent.body.id}/publish`, { method: 'POST' });
+  check('a fresh publish returns a storefront URL', Boolean(r.body.product?.onlineStoreUrl),
+    JSON.stringify(r.body.product));
+  check('  ...because it published to the channel', channelPublishes.length === beforePublishes + 1,
+    String(channelPublishes.length - beforePublishes));
+
+  // Without definitions the metafields are written but invisible to Liquid, so
+  // every event would render with no date and nothing would explain it.
+  check('the storefront metafield definitions are ensured',
+    ['event_id', 'starts_at', 'ends_at', 'location', 'ticket_type_id']
+      .every((k) => definedKeys.includes(k)),
+    JSON.stringify([...new Set(definedKeys)]));
+
+  // Taking it down must not put it back on the storefront.
+  const downBefore = channelPublishes.length;
+  await api(`/api/events/${freshEvent.body.id}/unpublish`, { method: 'POST' });
+  check('taking an event down does not re-publish it to the channel',
+    channelPublishes.length === downBefore, String(channelPublishes.length - downBefore));
 
   console.log(`\n${pass} passed, ${fail} failed`);
   server.close();
