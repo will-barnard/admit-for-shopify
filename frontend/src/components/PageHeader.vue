@@ -1,6 +1,6 @@
 <template>
   <header class="header">
-    <h1>Convention Ticket Manager</h1>
+    <h1>🎟️Admit</h1>
     <div class="header-actions">
       <span>Welcome, {{ authStore.user?.username }}</span>
       <button @click="$emit('change-password')" class="btn-secondary">Change Password</button>
