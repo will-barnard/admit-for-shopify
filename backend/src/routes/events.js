@@ -3,6 +3,7 @@ const { body, validationResult } = require('express-validator');
 const db = require('../config/database');
 const authMiddleware = require('../middleware/auth');
 const requireRole = require('../middleware/require-role');
+const eventPublish = require('../services/event-publish');
 
 // Reads stay open to any signed-in user - the scanner needs the active-event
 // list. Every write is admin or superadmin: a 'verifier' door account could
@@ -86,7 +87,7 @@ router.get('/', authMiddleware, async (req, res) => {
           SELECT json_agg(tt ORDER BY tt.sort_order, tt.id)
             FROM (
               SELECT tt.id, tt.name, tt.shopify_variant_id, tt.shopify_product_id,
-                     tt.shopify_sku, tt.capacity, tt.sort_order, tt.active,
+                     tt.shopify_sku, tt.capacity, tt.price, tt.sort_order, tt.active,
                      (SELECT COUNT(*) FROM tickets t
                        WHERE t.ticket_type_id = tt.id AND t.shop_id = tt.shop_id
                          AND (t.status IS NULL OR t.status = 'valid')) as ticket_count
@@ -175,11 +176,12 @@ router.post('/',
         for (const [i, t] of types.entries()) {
           const row = await client.query(
             `INSERT INTO event_ticket_types
-               (shop_id, event_id, name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, sort_order)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+               (shop_id, event_id, name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, sort_order, price)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
             [req.shopId, event.id, (t.name || 'General Admission').trim(),
              t.shopify_variant_id || null, t.shopify_product_id || null,
-             t.shopify_sku || null, t.capacity ?? null, t.sort_order ?? i]
+             t.shopify_sku || null, t.capacity ?? null, t.sort_order ?? i,
+             t.price === '' || t.price == null ? null : t.price]
           );
           inserted.push(row.rows[0]);
         }
@@ -351,6 +353,46 @@ router.post('/:id/unarchive', authMiddleware, canManageEvents, async (req, res) 
 });
 
 // ---------------------------------------------------------------------------
+// Publishing to the storefront
+//
+// Creates or updates the event's Shopify product: one variant per ticket type,
+// with the date and location alongside as metafields. Upserts on the event id,
+// so pressing Publish twice cannot make two products.
+// ---------------------------------------------------------------------------
+
+router.post('/:id/publish', authMiddleware, canManageEvents, async (req, res) => {
+  try {
+    const result = await eventPublish.publishEvent(req.shopId, req.params.id, {
+      collectionIds: Array.isArray(req.body?.collectionIds) ? req.body.collectionIds : [],
+      status: req.body?.status,
+    });
+    if (!result) return res.status(404).json({ error: 'Event not found' });
+    res.json(result);
+  } catch (error) {
+    // A refusal from Shopify is the merchant's problem to see, not a 500 -
+    // "you have no active ticket types" or "that handle is taken" are things
+    // they can act on. The message is already recorded on the event.
+    const isRefusal = error.name === 'AdminApiError' || /ticket type/i.test(error.message || '');
+    console.error('Error publishing event:', error.message);
+    res.status(isRefusal ? 400 : 500).json({
+      error: error.message || 'Failed to publish',
+      userErrors: error.userErrors || undefined,
+    });
+  }
+});
+
+router.post('/:id/unpublish', authMiddleware, canManageEvents, async (req, res) => {
+  try {
+    const result = await eventPublish.unpublishEvent(req.shopId, req.params.id);
+    if (!result) return res.status(404).json({ error: 'Event not found' });
+    res.json(result);
+  } catch (error) {
+    console.error('Error unpublishing event:', error.message);
+    res.status(error.name === 'AdminApiError' ? 400 : 500).json({ error: error.message || 'Failed to unpublish' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Ticket types
 //
 // An event has one or more. A simple event has exactly one and the UI can hide
@@ -394,16 +436,17 @@ router.post('/:id/ticket-types',
       );
       if (eventCheck.rows.length === 0) return res.status(404).json({ error: 'Event not found' });
 
-      const { name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, sort_order } = req.body;
+      const { name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, sort_order, price } = req.body;
 
       const result = await db.query(
         `INSERT INTO event_ticket_types
-           (shop_id, event_id, name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, sort_order)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, (
+           (shop_id, event_id, name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, price, sort_order)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $9, COALESCE($8, (
            SELECT COALESCE(MAX(sort_order) + 1, 0) FROM event_ticket_types WHERE event_id = $2 AND shop_id = $1
          ))) RETURNING *`,
         [req.shopId, req.params.id, name.trim(), shopify_variant_id || null,
-         shopify_product_id || null, shopify_sku || null, capacity ?? null, sort_order ?? null]
+         shopify_product_id || null, shopify_sku || null, capacity ?? null, sort_order ?? null,
+         price === '' || price == null ? null : price]
       );
       res.status(201).json(result.rows[0]);
     } catch (error) {
@@ -428,17 +471,19 @@ router.put('/:id/ticket-types/:typeId',
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const { name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, sort_order, active } = req.body;
+      const { name, shopify_variant_id, shopify_product_id, shopify_sku, capacity, sort_order, active, price } = req.body;
 
       const result = await db.query(
         `UPDATE event_ticket_types
             SET name = $1, shopify_variant_id = $2, shopify_product_id = $3, shopify_sku = $4,
-                capacity = $5, sort_order = COALESCE($6, sort_order), active = $7, updated_at = NOW()
+                capacity = $5, sort_order = COALESCE($6, sort_order), active = $7,
+                price = $11, updated_at = NOW()
           WHERE id = $8 AND event_id = $9 AND shop_id = $10
           RETURNING *`,
         [name.trim(), shopify_variant_id || null, shopify_product_id || null, shopify_sku || null,
          capacity ?? null, sort_order ?? null, active !== false,
-         req.params.typeId, req.params.id, req.shopId]
+         req.params.typeId, req.params.id, req.shopId,
+         price === '' || price == null ? null : price]
       );
       if (result.rows.length === 0) return res.status(404).json({ error: 'Ticket type not found' });
       res.json(result.rows[0]);

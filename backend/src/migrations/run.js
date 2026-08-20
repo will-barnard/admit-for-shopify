@@ -688,6 +688,37 @@ async function runMigrations() {
     await db.query('CREATE INDEX IF NOT EXISTS idx_events_starts_at ON events(shop_id, starts_at DESC)');
     console.log('\u2713 events.starts_at / ends_at ensured');
 
+    // ------------------------------------------------------------------
+    // Publishing an event to the storefront
+    //
+    // The app now creates the Shopify product for an event rather than being
+    // pointed at one somebody made by hand: one product per event, one variant
+    // per ticket type. So a ticket type needs a price, and an event needs to
+    // remember what it published and whether the last attempt worked.
+    //
+    // shopify_product_id is a convenience for linking, not the identity. The
+    // productSet mutation upserts on a unique metafield holding the event id,
+    // so re-publishing stays idempotent even if this column is empty or stale.
+    // ------------------------------------------------------------------
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'event_ticket_types' AND column_name = 'price') THEN
+          ALTER TABLE event_ticket_types ADD COLUMN price NUMERIC(10,2);
+        END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'events' AND column_name = 'shopify_product_id') THEN
+          ALTER TABLE events ADD COLUMN shopify_product_id VARCHAR(255);
+          ALTER TABLE events ADD COLUMN shopify_handle VARCHAR(255);
+          ALTER TABLE events ADD COLUMN published_at TIMESTAMP;
+          ALTER TABLE events ADD COLUMN publish_error TEXT;
+        END IF;
+      END $$;
+    `);
+    console.log('\u2713 Event publishing columns ensured');
+
     console.log('Migrations completed successfully!');
     process.exit(0);
   } catch (error) {
