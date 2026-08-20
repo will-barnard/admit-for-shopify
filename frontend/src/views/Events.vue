@@ -67,6 +67,8 @@
               <span v-else class="badge" :class="event.active ? 'active' : 'inactive'">
                 {{ event.active ? 'Active' : 'Inactive' }}
               </span>
+              <span v-if="event.published_at" class="badge published">On the storefront</span>
+              <span v-else-if="event.shopify_product_id" class="badge unpublished">Taken down</span>
             </div>
             <p v-if="event.description" class="event-desc">{{ event.description }}</p>
             <div class="event-meta">
@@ -115,9 +117,33 @@
               <span class="stat">{{ event.ticket_count || 0 }} tickets</span>
               <span class="stat">{{ event.checkin_count || 0 }} checked in</span>
             </div>
+
+            <!-- A refusal from Shopify is recorded on the event so it is visible
+                 here rather than only in a server log. -->
+            <p v-if="event.publish_error" class="publish-error">
+              Last publish failed: {{ event.publish_error }}
+            </p>
           </div>
           <div class="event-actions">
             <button @click="openEditModal(event)" class="btn-small" :disabled="event.archived">Edit</button>
+            <button
+              v-if="!event.published_at"
+              class="btn-small btn-publish"
+              :disabled="event.archived || publishing === event.id"
+              title="Create or update this event's Shopify product, one variant per ticket type"
+              @click="publishEvent(event)"
+            >
+              {{ publishing === event.id ? 'Publishing…' : 'Publish' }}
+            </button>
+            <button
+              v-else
+              class="btn-small"
+              :disabled="publishing === event.id"
+              title="Set the product back to draft. Nothing is deleted."
+              @click="unpublishEvent(event)"
+            >
+              {{ publishing === event.id ? 'Working…' : 'Take down' }}
+            </button>
             <button
               v-if="!event.archived"
               @click="archiveEvent(event)"
@@ -248,6 +274,10 @@
                   <input v-model="t.shopify_sku" type="text" class="type-input" placeholder="e.g. summer-fest-vip" />
                 </label>
                 <label class="mini narrow">
+                  Price
+                  <input v-model="t.price" type="number" min="0" step="0.01" class="type-input" placeholder="0.00" />
+                </label>
+                <label class="mini narrow">
                   Capacity
                   <input v-model="t.capacity" type="number" min="0" class="type-input" placeholder="none" />
                 </label>
@@ -313,6 +343,7 @@ export default {
     const modalError = ref('');
     const showArchived = ref(false);
     const showHelp = ref(false);
+    const publishing = ref(null);
 
     const form = reactive({
       name: '',
@@ -344,6 +375,7 @@ export default {
       shopify_variant_id: '',
       shopify_product_id: '',
       shopify_sku: '',
+      price: '',
       capacity: '',
       active: true,
       ticket_count: 0,
@@ -506,6 +538,7 @@ export default {
         shopify_variant_id: tt.shopify_variant_id || '',
         shopify_product_id: tt.shopify_product_id || '',
         shopify_sku: tt.shopify_sku || '',
+        price: tt.price ?? '',
         capacity: tt.capacity ?? '',
         active: tt.active !== false,
         ticket_count: Number(tt.ticket_count || 0),
@@ -558,6 +591,7 @@ export default {
       shopify_product_id: (t.shopify_product_id || '').trim() || null,
       shopify_sku: (t.shopify_sku || '').trim() || null,
       capacity: t.capacity === '' || t.capacity === null ? null : Number(t.capacity),
+      price: t.price === '' || t.price === null ? null : String(t.price),
       sort_order: i,
       active: t.active !== false
     });
@@ -635,6 +669,37 @@ export default {
       }
     };
 
+    // Publishing creates or updates the event's Shopify product. It upserts on
+    // the event id, so pressing it twice is safe - the guard is only to stop
+    // the button being clicked while a request is in flight.
+    const publishEvent = async (event) => {
+      publishing.value = event.id;
+      try {
+        const { data } = await axios.post(`/api/events/${event.id}/publish`);
+        await loadEvents();
+        const url = data.product?.onlineStoreUrl;
+        alert(`"${event.name}" is on the storefront${url ? `:\n${url}` : '.'}`);
+      } catch (err) {
+        alert(err.response?.data?.error || 'Could not publish this event');
+        await loadEvents();
+      } finally {
+        publishing.value = null;
+      }
+    };
+
+    const unpublishEvent = async (event) => {
+      if (!confirm(`Take "${event.name}" off the storefront? The product is set back to draft - nothing is deleted, and tickets already sold are unaffected.`)) return;
+      publishing.value = event.id;
+      try {
+        await axios.post(`/api/events/${event.id}/unpublish`);
+        await loadEvents();
+      } catch (err) {
+        alert(err.response?.data?.error || 'Could not take this event down');
+      } finally {
+        publishing.value = null;
+      }
+    };
+
     const deleteEvent = async (event) => {
       if (event.ticket_count > 0) return;
       if (!confirm(`Delete "${event.name}"? This cannot be undone.`)) return;
@@ -686,6 +751,7 @@ export default {
       embedded, picking, pickFor, adminProductUrl,
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
       archiveEvent, unarchiveEvent, loadEvents,
+      publishing, publishEvent, unpublishEvent,
       formatDate, formatWhen, onHasEndChanged, showChangePassword, handleLogout
     };
   }
@@ -748,6 +814,11 @@ export default {
 .badge.active { background: #e8f5e9; color: #2e7d32; }
 .badge.inactive { background: #fce4ec; color: #c62828; }
 .badge.archived-badge { background: #eceff1; color: #546e7a; }
+.badge.published { background: #e8f0fe; color: #1a4fa0; }
+.badge.unpublished { background: #f3f3f3; color: #777; }
+.publish-error { margin: 8px 0 0; font-size: 12px; color: #c33; }
+.btn-publish { border-color: #c9d0f5; color: #3f4a8a; }
+.btn-publish:hover { background: #f0f2ff; }
 
 .event-actions { display: flex; gap: 8px; flex-shrink: 0; }
 .btn-small { padding: 8px 16px; border: 1px solid #ddd; border-radius: 6px; background: white; cursor: pointer; font-size: 13px; transition: background 0.2s; }
@@ -792,7 +863,7 @@ export default {
 .type-row { border: 1px solid #e6e6e6; border-radius: 8px; padding: 12px; margin-bottom: 10px; background: #fbfbfd; }
 .type-row-main { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
 .type-row-main .name { flex: 1; font-weight: 600; }
-.type-row-fields { display: grid; grid-template-columns: 1fr 1fr 90px; gap: 8px; }
+.type-row-fields { display: grid; grid-template-columns: 1fr 1fr 90px 90px; gap: 8px; }
 .type-row-fields .mini { font-size: 11px; color: #777; font-weight: 400; margin: 0; }
 .type-row-fields .mini input { margin-top: 3px; }
 .type-input { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 13px; box-sizing: border-box; }

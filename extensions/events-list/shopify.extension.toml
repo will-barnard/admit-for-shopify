@@ -1,0 +1,9 @@
+# Theme app extension: the storefront events listing.
+#
+# Deployed with `shopify app deploy`, then added to a page in the theme editor
+# under Apps. It reads the metafields the app writes when an event is published
+# (services/event-publish.js), so it needs no network call of its own - the page
+# is plain Liquid, which means it is fast, cached, and indexable.
+name = "Admit events"
+type = "theme"
+handle = "events-list"

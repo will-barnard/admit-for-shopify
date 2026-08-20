@@ -1,0 +1,184 @@
+{%- comment -%}
+  Events listing.
+
+  Renders a collection of event products as an events page: one card per event
+  showing when and where it is, and its ticket types as the product's variants
+  with prices.
+
+  The event data comes from metafields the app writes on publish, under the
+  `admit` namespace: event_id, starts_at, ends_at, location. A product without
+  them still renders - it just shows no date - so a hand-made product dropped
+  into the collection degrades rather than breaking the page.
+
+  Sorting: Liquid's `sort` filter cannot follow a dotted path into metafields,
+  so the products are sorted by building "<unix-time>:<index>" strings, sorting
+  those, and reading the index back. Unix seconds are ten digits until the year
+  2286, so a plain string sort is chronological. Events with no date sort last
+  via an eleven-digit sentinel.
+{%- endcomment -%}
+
+{%- liquid
+  assign source = block.settings.collection
+  if source == blank
+    assign events = collection
+  else
+    assign events = source
+  endif
+  assign now = 'now' | date: '%s' | plus: 0
+-%}
+
+<div class="admit-events" {{ block.shopify_attributes }}>
+  {%- if block.settings.heading != blank -%}
+    <h2 class="admit-events__heading">{{ block.settings.heading }}</h2>
+  {%- endif -%}
+
+  {%- if events == blank or events.products.size == 0 -%}
+    <p class="admit-events__empty">
+      {{ block.settings.empty_text | default: 'No events are on sale right now.' }}
+    </p>
+  {%- else -%}
+
+    {%- liquid
+      assign keys = ''
+      for product in events.products
+        assign starts = product.metafields.admit.starts_at.value
+        if starts == blank
+          assign key = '99999999999'
+        else
+          assign key = starts | date: '%s'
+        endif
+        assign keys = keys | append: key | append: ':' | append: forloop.index0 | append: ','
+      endfor
+      assign sorted = keys | split: ',' | sort
+      assign shown = 0
+    -%}
+
+    <ul class="admit-events__list">
+      {%- for row in sorted -%}
+        {%- liquid
+          assign parts = row | split: ':'
+          assign index = parts[1] | plus: 0
+          assign product = events.products[index]
+          assign starts = product.metafields.admit.starts_at.value
+          assign ends = product.metafields.admit.ends_at.value
+          assign location = product.metafields.admit.location.value
+
+          # An event is over once its END has passed - a weekend pass is still
+          # live on the Sunday, which sorting by start alone would hide.
+          assign finish = ends | default: starts
+          assign finished = false
+          if finish != blank
+            assign finish_seconds = finish | date: '%s' | plus: 0
+            if finish_seconds < now
+              assign finished = true
+            endif
+          endif
+        -%}
+
+        {%- if finished and block.settings.hide_past -%}{%- continue -%}{%- endif -%}
+        {%- if block.settings.limit > 0 and shown >= block.settings.limit -%}{%- break -%}{%- endif -%}
+        {%- assign shown = shown | plus: 1 -%}
+
+        <li class="admit-event{% if finished %} admit-event--past{% endif %}">
+          {%- if block.settings.show_image and product.featured_image -%}
+            <a class="admit-event__image" href="{{ product.url }}">
+              {{ product.featured_image | image_url: width: 600 | image_tag: loading: 'lazy', alt: product.title }}
+            </a>
+          {%- endif -%}
+
+          <div class="admit-event__body">
+            <h3 class="admit-event__title">
+              <a href="{{ product.url }}">{{ product.title }}</a>
+            </h3>
+
+            {%- if starts != blank -%}
+              <p class="admit-event__when">
+                <time datetime="{{ starts }}">{{ starts | date: block.settings.date_format }}</time>
+                {%- if ends != blank -%}
+                  {%- assign start_day = starts | date: '%Y-%m-%d' -%}
+                  {%- assign end_day = ends | date: '%Y-%m-%d' -%}
+                  {%- if start_day == end_day -%}
+                    &ndash; <time datetime="{{ ends }}">{{ ends | date: '%-l:%M %p' }}</time>
+                  {%- else -%}
+                    &ndash; <time datetime="{{ ends }}">{{ ends | date: block.settings.date_format }}</time>
+                  {%- endif -%}
+                {%- endif -%}
+              </p>
+            {%- endif -%}
+
+            {%- if location != blank -%}
+              <p class="admit-event__where">{{ location }}</p>
+            {%- endif -%}
+
+            {%- if finished -%}
+              <p class="admit-event__over">This event has passed.</p>
+            {%- else -%}
+              <ul class="admit-event__tickets">
+                {%- for variant in product.variants -%}
+                  <li class="admit-ticket{% unless variant.available %} admit-ticket--sold-out{% endunless %}">
+                    <a href="{{ product.url }}?variant={{ variant.id }}">
+                      <span class="admit-ticket__name">{{ variant.title }}</span>
+                      <span class="admit-ticket__price">
+                        {%- if variant.available -%}
+                          {{ variant.price | money }}
+                        {%- else -%}
+                          Sold out
+                        {%- endif -%}
+                      </span>
+                    </a>
+                  </li>
+                {%- endfor -%}
+              </ul>
+            {%- endif -%}
+          </div>
+        </li>
+      {%- endfor -%}
+    </ul>
+
+    {%- if shown == 0 -%}
+      <p class="admit-events__empty">
+        {{ block.settings.empty_text | default: 'No events are on sale right now.' }}
+      </p>
+    {%- endif -%}
+  {%- endif -%}
+</div>
+
+{% schema %}
+{
+  "name": "Events list",
+  "target": "section",
+  "stylesheet": "events-list.css",
+  "settings": [
+    {
+      "type": "collection",
+      "id": "collection",
+      "label": "Events collection",
+      "info": "The collection holding your event products. Leave blank on a collection page to use that collection."
+    },
+    { "type": "text", "id": "heading", "label": "Heading", "default": "Upcoming events" },
+    {
+      "type": "checkbox",
+      "id": "hide_past",
+      "label": "Hide events that have finished",
+      "default": true,
+      "info": "An event stays listed until its end time, so a weekend pass is still shown on the Sunday."
+    },
+    { "type": "checkbox", "id": "show_image", "label": "Show product image", "default": true },
+    {
+      "type": "range",
+      "id": "limit",
+      "label": "Maximum events to show",
+      "min": 0, "max": 50, "step": 1, "default": 0,
+      "info": "0 shows all of them."
+    },
+    {
+      "type": "text",
+      "id": "date_format",
+      "label": "Date format",
+      "default": "%a %-d %b %Y, %-l:%M %p",
+      "info": "Liquid date format. %a weekday, %-d day, %b month, %Y year, %-l:%M %p time."
+    },
+    { "type": "text", "id": "empty_text", "label": "Text when there is nothing on", "default": "No events are on sale right now." }
+  ]
+}
+{% endschema %}

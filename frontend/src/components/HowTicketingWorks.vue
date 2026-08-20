@@ -6,70 +6,70 @@
     </div>
 
     <p class="how-lede">
-      <strong>An event lives only in this app.</strong> Shopify has no idea it exists — Shopify
-      sells <em>products</em>, this app issues <em>tickets</em>. The one thing joining them is a
-      ticket type pointing at a Shopify variant. Nothing here creates a product for you, and
-      nothing in Shopify creates an event.
+      <strong>An event lives here; Shopify sells it.</strong> Shopify has no concept of an event —
+      it sells <em>products</em>, and this app issues <em>tickets</em>. Publishing an event creates
+      its Shopify product for you: <strong>one product per event, one variant per ticket type</strong>.
+      You do not make the product by hand.
     </p>
 
     <ol class="how-steps">
       <li>
-        <h4>Make the product in Shopify</h4>
-        <p>
-          One product per show. One <strong>variant per kind of ticket</strong> — VIP, Adult,
-          Child, Saturday-only. Selling one kind of ticket? One variant is all you need.
-          Set the variant's inventory there if you want Shopify to stop the sale when you sell out.
-        </p>
-      </li>
-      <li>
-        <h4>Create the event here</h4>
+        <h4>Create the event</h4>
         <p>
           Name, when it starts, and where. If it runs across more than one day — a weekend pass —
-          tick <em>Runs until a later date or time</em> and give it an end. It stays one event,
-          with one set of numbers.
+          tick <em>Runs until a later date or time</em> and give it an end. It stays one event, with
+          one set of numbers.
         </p>
       </li>
       <li>
-        <h4>Point each ticket type at its variant</h4>
+        <h4>Add a ticket type for each thing you sell</h4>
         <p>
-          This is the actual hook-up, and the step that is easy to skip.
-          <template v-if="embedded">
-            Use <strong>Pick in Shopify</strong> on the ticket type row and choose the variant —
-            no copying IDs.
-          </template>
-          <template v-else>
-            Paste the variant ID from the Shopify admin (it is the number at the end of the
-            product URL when a variant is selected), or the SKU.
-          </template>
-          Orders match on <strong>variant ID first</strong>, then SKU — a variant ID never changes,
-          but a SKU is free text somebody can tidy up in Shopify without realising it breaks this.
+          VIP, Adult, Child, Saturday-only — each with a price. Selling one kind of ticket? One type
+          is all you need, and you can ignore the idea entirely. Capacity is optional and is enforced
+          <em>here</em>, not in Shopify.
+        </p>
+      </li>
+      <li>
+        <h4>Press Publish</h4>
+        <p>
+          The app creates the Shopify product and one variant per ticket type, and writes the date
+          and location alongside it so a storefront events page can show them. Publish again after
+          any change — it updates the same product rather than making a second one, and renaming a
+          ticket type edits its variant rather than replacing it, so tickets already sold keep
+          working.
         </p>
       </li>
       <li>
         <h4>Someone buys a ticket</h4>
         <p>
-          Shopify sends the order here, the app matches each line item to a ticket type, issues one
-          ticket per unit, and emails the QR codes. Refunds and cancellations void the matching
-          tickets automatically.
+          Shopify sends the order here, the app matches each line item back to its ticket type,
+          issues one ticket per unit, and emails the QR codes. Refunds and cancellations void the
+          matching tickets automatically.
         </p>
       </li>
     </ol>
 
+    <p class="how-storefront">
+      To show these on your site, add the <strong>Events list</strong> block to a page in the theme
+      editor (Apps → Admit events) and point it at the collection holding your event products.
+    </p>
+
     <div class="how-callout">
       <h4>When a ticket does not turn up</h4>
       <p>
-        Almost always the mapping. A ticket type with nothing in it is marked
-        <span class="how-chip">not mapped</span> on the event card — orders can never match it.
+        Usually the event was never published, or was changed after publishing and not published
+        again — a ticket type with no variant behind it is marked
+        <span class="how-chip">not mapped</span> on the event card, and orders can never match it.
         If a line item matched nothing, the order shows up under
-        <strong>Webhooks → Needs attention</strong> with the SKU that missed, and you can map it and
-        retry the order without asking the customer to do anything.
+        <strong>Webhooks → Needs attention</strong> with the SKU that missed, and you can fix the
+        mapping and retry the order without asking the customer to do anything.
       </p>
     </div>
 
     <p class="how-footnote">
       Archiving an event hides it and <strong>stops its tickets scanning</strong> — do it after the
-      show, not before. Deactivating a ticket type stops new sales matching it but leaves tickets
-      already issued working.
+      show, not before. Taking an event off the storefront only sets its product back to draft;
+      nothing is deleted and tickets already sold are unaffected.
     </p>
   </div>
 </template>
@@ -84,8 +84,8 @@ export default {
   },
   emits: ['close'],
   setup() {
-    // The instructions differ: the variant picker only exists inside the
-    // Shopify admin, so telling a standalone user to click it would be wrong.
+    // Kept for the picker hint elsewhere in the form: it only exists inside
+    // the Shopify admin, so telling a standalone user to click it would be wrong.
     return { embedded: isEmbedded() };
   },
 };
@@ -132,4 +132,5 @@ export default {
 }
 
 .how-footnote { margin: 0; font-size: 13px; color: #777; line-height: 1.6; }
+.how-storefront { margin: 14px 0 0; font-size: 14px; color: #3f4a8a; line-height: 1.6; }
 </style>
