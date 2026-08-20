@@ -22,16 +22,36 @@
             <input v-model="showArchived" type="checkbox" @change="loadEvents" />
             Show archived
           </label>
+          <button type="button" class="btn-help" @click="showHelp = !showHelp">
+            {{ showHelp ? 'Hide guide' : 'How ticketing works' }}
+          </button>
           <button @click="openCreateModal" class="btn-primary">+ New Event</button>
         </div>
       </div>
+
+      <!-- Opened deliberately, or shown unprompted when there is nothing here
+           yet - the first event is exactly when the Shopify hook-up is not
+           obvious, because none of it lives in Shopify. -->
+      <HowTicketingWorks
+        v-if="showHelp"
+        :dismissible="true"
+        @close="showHelp = false"
+      />
 
       <div v-if="loading" class="loading">Loading events...</div>
       <div v-else-if="error" class="error-message">{{ error }}</div>
 
       <div v-else class="events-list">
         <div v-if="events.length === 0" class="empty-state">
-          <p>No events yet. Create your first event to get started.</p>
+          <p v-if="showArchived">No events, archived or otherwise.</p>
+          <template v-else>
+            <p><strong>No events yet.</strong></p>
+            <p class="empty-hint">
+              An event lives only in this app — start with the product in Shopify, then create the
+              event here and point its ticket types at the right variants.
+            </p>
+            <button @click="openCreateModal" class="btn-primary">Create your first event</button>
+          </template>
         </div>
 
         <div
@@ -185,6 +205,7 @@
               Each type maps to one Shopify variant. Orders match on variant ID first, then SKU.
               One type is all a simple event needs.
               <template v-if="embedded"> Use <em>Pick in Shopify</em> rather than typing an ID.</template>
+              <a href="#" class="hint-link" @click.prevent="openHelpFromModal">How does this connect to Shopify?</a>
             </p>
 
             <div v-for="(t, i) in types" :key="t.key" class="type-row">
@@ -271,12 +292,13 @@ import axios from 'axios';
 import ChangePasswordModal from '@/components/ChangePasswordModal.vue';
 import PageHeader from '@/components/PageHeader.vue';
 import { isEmbedded, pickVariant, shopDomain } from '@/shopify';
+import HowTicketingWorks from '@/components/HowTicketingWorks.vue';
 
 let rowKey = 0;
 
 export default {
   name: 'Events',
-  components: { ChangePasswordModal, PageHeader },
+  components: { ChangePasswordModal, PageHeader, HowTicketingWorks },
   setup() {
     const router = useRouter();
     const authStore = useAuthStore();
@@ -290,6 +312,7 @@ export default {
     const saving = ref(false);
     const modalError = ref('');
     const showArchived = ref(false);
+    const showHelp = ref(false);
 
     const form = reactive({
       name: '',
@@ -367,6 +390,12 @@ export default {
       return `${startText} – ${[prettyDate(event.ends_at), prettyTime(event.ends_at)].filter(Boolean).join(', ')}`;
     };
 
+    // Close the form first - the guide sits behind the modal otherwise.
+    const openHelpFromModal = () => {
+      showModal.value = false;
+      showHelp.value = true;
+    };
+
     const onHasEndChanged = () => {
       if (form.has_end && !form.end_date) form.end_date = form.start_date;
       if (!form.has_end) { form.end_date = ''; form.end_time = ''; }
@@ -429,6 +458,9 @@ export default {
         const params = showArchived.value ? { include_archived: 'true' } : {};
         const response = await axios.get('/api/events', { params });
         events.value = response.data;
+        // Nothing set up yet: lead with the explanation rather than an empty
+        // page and a New Event button that does not say what happens next.
+        if (events.value.length === 0 && !showArchived.value) showHelp.value = true;
       } catch (err) {
         error.value = 'Failed to load events';
       } finally {
@@ -649,7 +681,7 @@ export default {
 
     return {
       authStore, events, loading, error, isChangePasswordOpen, showModal,
-      editingEvent, saving, modalError, form, showArchived,
+      editingEvent, saving, modalError, form, showArchived, showHelp, openHelpFromModal,
       types, addType, removeType, isMapped, mappingLabel, removeTitle, capacityState,
       embedded, picking, pickFor, adminProductUrl,
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
@@ -728,6 +760,13 @@ export default {
 .btn-primary:hover { background: #5568d3; }
 .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; }
 .btn-secondary { padding: 10px 24px; background: white; color: #667eea; border: 1px solid #667eea; border-radius: 8px; cursor: pointer; font-size: 14px; }
+.btn-help {
+  padding: 10px 18px; background: white; color: #667eea; border: 1px solid #c9d0f5;
+  border-radius: 8px; cursor: pointer; font-size: 14px;
+}
+.btn-help:hover { background: #f2f4ff; }
+.empty-hint { max-width: 60ch; margin: 6px auto 18px; line-height: 1.6; }
+.hint-link { color: #667eea; margin-left: 6px; }
 .btn-link { background: none; border: none; color: #667eea; cursor: pointer; font-size: 13px; padding: 0; }
 .btn-link:hover { text-decoration: underline; }
 
