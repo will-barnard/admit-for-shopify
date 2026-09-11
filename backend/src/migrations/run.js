@@ -719,6 +719,41 @@ async function runMigrations() {
     `);
     console.log('\u2713 Event publishing columns ensured');
 
+    // ------------------------------------------------------------------
+    // Day-of reminder emails
+    //
+    // One reminder per event, sent once, at a specified clock time on the
+    // event's own start date - "day of" means the calendar day of
+    // events.starts_at, evaluated in the shop's own settings.timezone, not
+    // whatever timezone this container happens to run in.
+    //
+    // reminder_sent_at IS NULL doubles as "not yet claimed": services/
+    // reminder-jobs.js claims a due event by setting it in the same UPDATE
+    // that selects it, so two ticks of the worker (or two replicas) can never
+    // send the same event's reminder twice. The trade-off, deliberately
+    // consistent with how ticket and bulk email already behave elsewhere in
+    // this app: a crash between claim and send does not retry. Editing
+    // reminder_enabled or reminder_time re-arms the event - see
+    // routes/events.js.
+    // ------------------------------------------------------------------
+    await db.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                        WHERE table_name = 'events' AND column_name = 'reminder_enabled') THEN
+          ALTER TABLE events ADD COLUMN reminder_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+          ALTER TABLE events ADD COLUMN reminder_time TIME;
+          ALTER TABLE events ADD COLUMN reminder_sent_at TIMESTAMP;
+        END IF;
+      END $$;
+    `);
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_events_reminder_due
+        ON events (shop_id, starts_at)
+        WHERE reminder_enabled = true AND reminder_sent_at IS NULL
+    `);
+    console.log('\u2713 Event reminder columns ensured');
+
     console.log('Migrations completed successfully!');
     process.exit(0);
   } catch (error) {

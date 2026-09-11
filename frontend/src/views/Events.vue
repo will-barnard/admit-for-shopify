@@ -74,6 +74,9 @@
             <div class="event-meta">
               <span v-if="event.starts_at"><strong>When:</strong> {{ formatWhen(event) }}</span>
               <span v-if="event.location"><strong>Location:</strong> {{ event.location }}</span>
+              <span v-if="event.reminder_enabled" :class="{ 'reminder-sent': event.reminder_sent_at }">
+                <strong>Reminder:</strong> {{ reminderLabel(event) }}
+              </span>
               <span v-if="event.archived && event.archived_at">
                 <strong>Archived:</strong> {{ formatDate(event.archived_at) }}
               </span>
@@ -221,6 +224,34 @@
             <input v-model="form.location" type="text" placeholder="e.g. Convention Center, Hall A" />
           </div>
 
+          <div class="form-group">
+            <label class="checkbox-label">
+              <input v-model="form.reminder_enabled" type="checkbox" />
+              Send a reminder email the day of the event
+            </label>
+            <div v-if="form.reminder_enabled" class="form-row reminder-row">
+              <div class="form-group">
+                <label>Reminder time</label>
+                <input v-model="form.reminder_time" type="time" required />
+                <p class="hint">Sent once, on the event's own date, to everyone with a valid ticket.</p>
+              </div>
+            </div>
+            <p v-if="editingEvent && editingEvent.reminder_sent_at" class="hint reminder-sent-hint">
+              Already sent for this event, at {{ prettyTime(editingEvent.reminder_sent_at) }} on
+              {{ prettyDate(editingEvent.reminder_sent_at) }}. Changing the time or toggling this
+              off and back on will let it send again.
+            </p>
+            <button
+              v-if="editingEvent && form.reminder_enabled && authStore.user?.role === 'superadmin'"
+              type="button"
+              class="btn-link"
+              :disabled="sendingReminder"
+              @click="sendReminderNow(editingEvent)"
+            >
+              {{ sendingReminder ? 'Sending…' : (editingEvent.reminder_sent_at ? 'Send again now' : 'Send now (test)') }}
+            </button>
+          </div>
+
           <!-- Ticket types -->
           <div class="form-group">
             <div class="section-head">
@@ -344,6 +375,7 @@ export default {
     const showArchived = ref(false);
     const showHelp = ref(false);
     const publishing = ref(null);
+    const sendingReminder = ref(false);
 
     const form = reactive({
       name: '',
@@ -354,7 +386,9 @@ export default {
       end_date: '',
       end_time: '',
       location: '',
-      active: true
+      active: true,
+      reminder_enabled: false,
+      reminder_time: ''
     });
 
     // Editable ticket-type rows. `id` is present for rows that already exist in
@@ -422,6 +456,14 @@ export default {
       return `${startText} – ${[prettyDate(event.ends_at), prettyTime(event.ends_at)].filter(Boolean).join(', ')}`;
     };
 
+    const reminderLabel = (event) => {
+      const time = prettyTime(`2000-01-01 ${event.reminder_time || ''}`.trim());
+      if (event.reminder_sent_at) {
+        return `sent (was set for ${time || 'day of'})`;
+      }
+      return time ? `${time}, day of (not sent yet)` : 'day of (not sent yet)';
+    };
+
     // Close the form first - the guide sits behind the modal otherwise.
     const openHelpFromModal = () => {
       showModal.value = false;
@@ -479,6 +521,8 @@ export default {
       form.end_time = '';
       form.location = '';
       form.active = true;
+      form.reminder_enabled = false;
+      form.reminder_time = '';
       types.value = [blankType('General Admission')];
       originalTypeIds.value = [];
       modalError.value = '';
@@ -520,6 +564,10 @@ export default {
       form.end_time = end.time;
       form.location = event.location || '';
       form.active = event.active;
+      form.reminder_enabled = Boolean(event.reminder_enabled);
+      // reminder_time comes back from Postgres as 'HH:MM:SS' (or null); the
+      // <input type="time"> element wants 'HH:MM'.
+      form.reminder_time = (event.reminder_time || '').slice(0, 5);
       showModal.value = true;
 
       // The list endpoint already embeds ticket_types; re-fetch so an edit
@@ -619,6 +667,12 @@ export default {
         // Compose the naive timestamps the API expects. A blank start time
         // means midnight, which is how "no time set" is stored - the API reads
         // it back as no time.
+        if (form.reminder_enabled && !form.reminder_time) {
+          modalError.value = 'Set a time for the day-of reminder, or turn it off';
+          saving.value = false;
+          return;
+        }
+
         const payload = {
           name: form.name,
           description: form.description,
@@ -629,6 +683,8 @@ export default {
           ends_at: form.has_end && form.end_date
             ? (form.end_time ? `${form.end_date} ${form.end_time}` : form.end_date)
             : null,
+          reminder_enabled: form.reminder_enabled,
+          reminder_time: form.reminder_enabled ? form.reminder_time : null,
         };
         if (!form.start_date) {
           modalError.value = 'An event needs a start date';
@@ -700,6 +756,24 @@ export default {
       }
     };
 
+    const sendReminderNow = async (event) => {
+      const already = Boolean(event.reminder_sent_at);
+      if (already && !confirm(`A reminder for "${event.name}" was already sent. Send it again to everyone with a valid ticket?`)) return;
+      sendingReminder.value = true;
+      try {
+        const { data } = await axios.post(`/api/events/${event.id}/reminder/send-now`, already ? { force: true } : {});
+        alert(`Reminder sent for "${event.name}": ${data.sent} sent, ${data.failed} failed, ${data.total} recipient(s).`);
+        await loadEvents();
+        if (editingEvent.value && editingEvent.value.id === event.id) {
+          editingEvent.value = { ...editingEvent.value, reminder_sent_at: data.event.reminder_sent_at };
+        }
+      } catch (err) {
+        alert(err.response?.data?.error || 'Could not send the reminder');
+      } finally {
+        sendingReminder.value = false;
+      }
+    };
+
     const deleteEvent = async (event) => {
       if (event.ticket_count > 0) return;
       if (!confirm(`Delete "${event.name}"? This cannot be undone.`)) return;
@@ -752,7 +826,9 @@ export default {
       openCreateModal, openEditModal, closeModal, saveEvent, deleteEvent,
       archiveEvent, unarchiveEvent, loadEvents,
       publishing, publishEvent, unpublishEvent,
-      formatDate, formatWhen, onHasEndChanged, showChangePassword, handleLogout
+      formatDate, formatWhen, onHasEndChanged, showChangePassword, handleLogout,
+      reminderLabel, prettyTime, prettyDate, splitStamp,
+      sendingReminder, sendReminderNow
     };
   }
 };
@@ -790,6 +866,7 @@ export default {
 .event-desc { color: #666; margin: 0 0 12px 0; font-size: 14px; }
 
 .event-meta { display: flex; flex-wrap: wrap; gap: 16px; font-size: 13px; color: #555; margin-bottom: 8px; }
+.event-meta .reminder-sent { color: #2e7d32; }
 
 .ticket-types { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .type-chip {
@@ -853,6 +930,8 @@ export default {
 .form-group textarea { resize: vertical; }
 .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .hint { font-size: 12px; color: #888; margin-top: 4px; margin-bottom: 10px; }
+.reminder-row { margin-top: 10px; margin-bottom: 0; }
+.reminder-sent-hint { color: #2e7d32; margin-top: 8px; }
 .checkbox-label { display: flex; align-items: center; gap: 8px; cursor: pointer; }
 .checkbox-label input { width: auto; }
 .checkbox-label.small { font-size: 13px; font-weight: 400; margin: 0; }

@@ -4,6 +4,7 @@ const db = require('../config/database');
 const authMiddleware = require('../middleware/auth');
 const requireRole = require('../middleware/require-role');
 const eventPublish = require('../services/event-publish');
+const reminderJobs = require('../services/reminder-jobs');
 
 // Reads stay open to any signed-in user - the scanner needs the active-event
 // list. Every write is admin or superadmin: a 'verifier' door account could
@@ -69,6 +70,23 @@ function invalidTime(value) {
     error: 'Event time must be a single clock time, such as 19:00 or 7:00 PM. '
       + 'For a range like "10:00 AM - 6:00 PM", put it in the description for now.',
   };
+}
+
+/**
+ * The reminder time reuses the event-time clock format (a single time of day,
+ * no ranges) - it is "what time should the reminder go out", not a window.
+ */
+function invalidReminderTime(value) {
+  if (value === undefined || value === null || value === '') return null;
+  if (TIME_PATTERN.test(String(value).trim())) return null;
+  return {
+    error: 'Reminder time must be a single clock time, such as 09:00 or 9:00 AM.',
+  };
+}
+
+/** true/false from either a JSON boolean or the string a form field sends. */
+function parseBoolean(value) {
+  return value === true || value === 'true';
 }
 
 const router = express.Router();
@@ -141,6 +159,7 @@ router.post('/',
   body('location').optional({ nullable: true, checkFalsy: true }).trim(),
   body('description').optional({ nullable: true, checkFalsy: true }).trim(),
   body('event_time').optional({ nullable: true, checkFalsy: true }).trim(),
+  body('reminder_time').optional({ nullable: true, checkFalsy: true }).trim(),
   async (req, res) => {
     try {
       const errors = validationResult(req);
@@ -153,15 +172,24 @@ router.post('/',
       const timeProblem = invalidTime(req.body.event_time);
       if (timeProblem) return res.status(400).json(timeProblem);
 
+      const reminderEnabled = parseBoolean(req.body.reminder_enabled);
+      const reminderTime = (req.body.reminder_time || '').trim() || null;
+      const reminderTimeProblem = invalidReminderTime(reminderTime);
+      if (reminderTimeProblem) return res.status(400).json(reminderTimeProblem);
+      if (reminderEnabled && !reminderTime) {
+        return res.status(400).json({ error: 'A reminder needs a time - set reminder_time, e.g. 09:00 or 9:00 AM.' });
+      }
+
       const window = resolveWindow(req.body);
       if (window.error) return res.status(400).json({ error: window.error });
 
       const created = await db.withTransaction(async (client) => {
         const eventResult = await client.query(
-          `INSERT INTO events (shop_id, name, description, starts_at, ends_at, location)
-           VALUES ($4, $5, $6, ${STARTS_AT_SQL}, $7::timestamp, $8) RETURNING *`,
+          `INSERT INTO events (shop_id, name, description, starts_at, ends_at, location, reminder_enabled, reminder_time)
+           VALUES ($4, $5, $6, ${STARTS_AT_SQL}, $7::timestamp, $8, $9, $10::time) RETURNING *`,
           [window.startsAt, window.eventDate, window.eventTime,
-           req.shopId, name, description || null, window.endsAt, location || null]
+           req.shopId, name, description || null, window.endsAt, location || null,
+           reminderEnabled, reminderTime]
         );
         const event = eventResult.rows[0];
 
@@ -223,17 +251,44 @@ router.put('/:id',
       const timeProblem = invalidTime(req.body.event_time);
       if (timeProblem) return res.status(400).json(timeProblem);
 
+      const reminderEnabled = parseBoolean(req.body.reminder_enabled);
+      const reminderTime = (req.body.reminder_time || '').trim() || null;
+      const reminderTimeProblem = invalidReminderTime(reminderTime);
+      if (reminderTimeProblem) return res.status(400).json(reminderTimeProblem);
+      if (reminderEnabled && !reminderTime) {
+        return res.status(400).json({ error: 'A reminder needs a time - set reminder_time, e.g. 09:00 or 9:00 AM.' });
+      }
+
       const window = resolveWindow(req.body);
       if (window.error) return res.status(400).json({ error: window.error });
 
       // events.sku is no longer written - the Shopify mapping lives on
       // event_ticket_types. The column is retained for historical rows.
+      //
+      // reminder_sent_at resets to NULL whenever this save actually changes
+      // reminder_enabled or reminder_time - editing either is how the
+      // merchant re-arms a reminder (turn it off and on, fix a typo'd time),
+      // and a save that leaves them untouched must not disturb an
+      // already-sent flag.
       const result = await db.query(
-        `UPDATE events SET name = $4, description = $5, starts_at = ${STARTS_AT_SQL},
-         ends_at = $6::timestamp, location = $7, active = $8, updated_at = NOW()
+        `WITH current AS (
+           SELECT reminder_enabled AS old_enabled, reminder_time AS old_time
+             FROM events WHERE id = $9 AND shop_id = $10
+         )
+         UPDATE events SET
+           name = $4, description = $5, starts_at = ${STARTS_AT_SQL},
+           ends_at = $6::timestamp, location = $7, active = $8,
+           reminder_enabled = $11, reminder_time = $12::time,
+           reminder_sent_at = CASE
+             WHEN (SELECT old_enabled FROM current) IS DISTINCT FROM $11
+               OR (SELECT old_time FROM current) IS DISTINCT FROM $12::time
+             THEN NULL ELSE events.reminder_sent_at
+           END,
+           updated_at = NOW()
          WHERE id = $9 AND shop_id = $10 RETURNING *`,
         [window.startsAt, window.eventDate, window.eventTime,
-         name, description || null, window.endsAt, location || null, active !== false, id, req.shopId]
+         name, description || null, window.endsAt, location || null, active !== false, id, req.shopId,
+         reminderEnabled, reminderTime]
       );
 
       if (result.rows.length === 0) {
@@ -389,6 +444,47 @@ router.post('/:id/unpublish', authMiddleware, canManageEvents, async (req, res) 
   } catch (error) {
     console.error('Error unpublishing event:', error.message);
     res.status(error.name === 'AdminApiError' ? 400 : 500).json({ error: error.message || 'Failed to unpublish' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Manual reminder send
+//
+// The scheduled worker (services/reminder-jobs.js) only fires a reminder on
+// the event's own day, at reminder_time. This lets a superadmin send it right
+// now instead - to test the email before the real day, or to send a reminder
+// that was never turned on. Superadmin only, same as bulk-email: this emails
+// every ticket holder at once, which is a bigger blast radius than the
+// per-event admin/superadmin actions above.
+//
+// Claiming works the same way the worker's CLAIM_SQL does - reminder_sent_at
+// is set in the same UPDATE that checks it is unset, so this cannot race the
+// worker into sending the same event's reminder twice. Pass { force: true }
+// to resend anyway (e.g. after adding late RSVPs).
+// ---------------------------------------------------------------------------
+router.post('/:id/reminder/send-now', authMiddleware, requireRole('superadmin'), async (req, res) => {
+  try {
+    const force = req.body?.force === true;
+    const claimed = await db.query(
+      `UPDATE events
+          SET reminder_sent_at = NOW()
+        WHERE id = $1 AND shop_id = $2
+          AND ($3::boolean OR reminder_sent_at IS NULL)
+        RETURNING *, starts_at::text AS starts_at_text, ends_at::text AS ends_at_text`,
+      [req.params.id, req.shopId, force]
+    );
+
+    if (claimed.rows.length === 0) {
+      const exists = await db.query('SELECT 1 FROM events WHERE id = $1 AND shop_id = $2', [req.params.id, req.shopId]);
+      if (exists.rows.length === 0) return res.status(404).json({ error: 'Event not found' });
+      return res.status(409).json({ error: 'A reminder was already sent for this event. Pass { "force": true } to send it again.' });
+    }
+
+    const outcome = await reminderJobs.sendEventReminder(claimed.rows[0]);
+    res.json({ event: claimed.rows[0], ...outcome });
+  } catch (error) {
+    console.error('Error sending reminder now:', error.message);
+    res.status(500).json({ error: error.message || 'Failed to send reminder' });
   }
 });
 
