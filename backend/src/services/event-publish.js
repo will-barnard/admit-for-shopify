@@ -288,6 +288,11 @@ async function publishEvent(shopId, eventId, { collectionIds = [], status } = {}
 
   // Creating it is not the same as putting it on sale.
   let onlineStoreUrl = product.onlineStoreUrl || null;
+  // Carried into the save below rather than written here and then immediately
+  // overwritten by it - a failure used to be recorded and wiped out in the same
+  // publish, so the admin always looked like a clean success even when the
+  // event never actually reached the storefront.
+  let onlineStoreError = null;
   if (!onlineStoreUrl && (status || 'ACTIVE') !== 'DRAFT') {
     try {
       onlineStoreUrl = await publishToOnlineStore(shopId, product.id);
@@ -295,20 +300,17 @@ async function publishEvent(shopId, eventId, { collectionIds = [], status } = {}
       // The product exists and is correct; it is just not on the storefront
       // yet. Say so rather than failing the whole publish.
       console.error('Could not put the event on the Online Store:', error.message);
-      await db.query(
-        'UPDATE events SET publish_error = $1 WHERE id = $2 AND shop_id = $3',
-        [`Created, but not added to the Online Store: ${error.message}`, eventId, shopId]
-      );
+      onlineStoreError = `Created, but not added to the Online Store: ${error.message}`;
     }
   }
 
   const saved = await db.query(
     `UPDATE events
         SET shopify_product_id = $1, shopify_handle = $2, published_at = NOW(),
-            publish_error = NULL, updated_at = NOW()
-      WHERE id = $3 AND shop_id = $4
+            publish_error = $3, updated_at = NOW()
+      WHERE id = $4 AND shop_id = $5
       RETURNING *`,
-    [gid.toNumeric(product.id), product.handle, eventId, shopId]
+    [gid.toNumeric(product.id), product.handle, onlineStoreError, eventId, shopId]
   );
 
   return {

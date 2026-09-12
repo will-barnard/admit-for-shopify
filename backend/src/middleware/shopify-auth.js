@@ -2,6 +2,7 @@ const { verifySessionToken, extractSessionToken } = require('../shopify/session-
 const { exchangeToken } = require('../shopify/token-exchange');
 const { isConfigured } = require('../shopify/config');
 const { upsertShop, getShopByDomain } = require('../shopify/shops');
+const { ensureWebhooksForDomain } = require('../shopify/webhooks-registration');
 const { resolveShopifyUser } = require('../shopify/users');
 
 /**
@@ -66,6 +67,18 @@ async function shopifyAuth(req, res, next) {
         refreshTokenExpiresIn: exchanged.refreshTokenExpiresIn,
       });
       console.log(`Stored offline access token for ${verified.shopDomain}`);
+
+      // shopify.app.toml's [webhooks] block only reaches Shopify via
+      // `shopify app deploy`, which this project doesn't use - so a fresh
+      // install has an access token but no subscriptions and would never see
+      // an order. Register them for real, right now, instead of waiting on a
+      // deploy that isn't coming. Not awaited: this request is serving the
+      // embedded admin's first load, and a slow Shopify API call here
+      // shouldn't hold that up - failures are logged and retried on the next
+      // boot's ensureWebhooksForAllShops() regardless.
+      ensureWebhooksForDomain(verified.shopDomain).catch((error) => {
+        console.error(`Could not register webhooks for ${verified.shopDomain}:`, error.message);
+      });
     }
   } catch (error) {
     // Don't fail the request: the app is useful without an Admin API token,

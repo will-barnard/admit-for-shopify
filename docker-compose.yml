@@ -59,7 +59,7 @@ services:
         condition: service_healthy
     volumes:
       - backend_uploads:/app/uploads
-    command: sh -c "npm run migrate && npm run seed && node src/migrations/seed-superadmin.js && node src/migrations/seed-verifier.js && npm start"
+    command: sh -c "npm run migrate && npm run seed && node src/migrations/seed-superadmin.js && node src/migrations/seed-verifier.js && node src/migrations/ensure-webhooks.js && npm start"
     networks:
       - internal
 
