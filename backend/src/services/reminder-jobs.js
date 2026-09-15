@@ -17,6 +17,7 @@
  * reminder_time re-arms the event - see routes/events.js.
  */
 
+const QRCode = require('qrcode');
 const db = require('../config/database');
 const { sendViaResend, getSender } = require('./email');
 const { remainingQuota } = require('./email-quota');
@@ -100,10 +101,21 @@ async function claimDueEvent() {
   return result.rows[0] || null;
 }
 
+/**
+ * recipient.tickets is one or more { uuid } rows, in the same order the QR
+ * attachments were built in (see sendEventReminder) - index i here must line
+ * up with the attachment's content_id `qrcode${i}` for the cid reference to
+ * resolve to the right image.
+ */
 function renderReminderEmail({ event, orgName, when }, recipient) {
-  const ticketNote = recipient.ticket_count > 1
-    ? `<p>You have ${recipient.ticket_count} tickets for this event.</p>`
+  const multiNote = recipient.tickets.length > 1
+    ? `<p>You have ${recipient.tickets.length} tickets for this event - each QR code below is a separate ticket.</p>`
     : '';
+  const ticketBlocks = recipient.tickets.map((t, i) => `
+        <div style="text-align: center; margin: 16px 0; padding: 16px; border: 1px solid #ddd; border-radius: 8px; background: white;">
+          <img src="cid:qrcode${i}" style="max-width: 220px; width: 100%;" alt="Ticket QR code" />
+          ${recipient.tickets.length > 1 ? `<p style="margin: 8px 0 0; font-size: 12px; color: #666;">Ticket ${i + 1} of ${recipient.tickets.length}</p>` : ''}
+        </div>`).join('');
   return `
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; color: #333;">
       <div style="background-color: #4CAF50; color: white; padding: 20px; text-align: center; border-radius: 8px 8px 0 0;">
@@ -113,7 +125,9 @@ function renderReminderEmail({ event, orgName, when }, recipient) {
         <p>Hi ${escapeHtml(recipient.name || 'there')},</p>
         <p>Just a reminder that <strong>${escapeHtml(event.name)}</strong> is happening today${when ? `, ${escapeHtml(when)}` : ''}.</p>
         ${event.location ? `<p><strong>Location:</strong> ${escapeHtml(event.location)}</p>` : ''}
-        ${ticketNote}
+        ${multiNote}
+        <p><strong>Your ticket QR code${recipient.tickets.length > 1 ? 's are' : ' is'} below</strong> - present it at the entrance for check-in.</p>
+        ${ticketBlocks}
         <p>We look forward to seeing you!</p>
         <p style="color: #888; font-size: 12px; margin-top: 24px;">This is an automated reminder from ${escapeHtml(orgName)}.</p>
       </div>
@@ -122,9 +136,16 @@ function renderReminderEmail({ event, orgName, when }, recipient) {
 }
 
 /**
- * Send one event's reminder to every valid ticket holder with an email on
- * file, one row per distinct address (someone holding two tickets for the
- * same event gets one reminder, not two).
+ * Send one event's reminder - QR code(s) included - to every valid ticket
+ * holder with an email on file. One email per distinct address: someone
+ * holding two tickets for the same event gets one email with two QR codes,
+ * not two emails.
+ *
+ * QR codes are per-ticket (each encodes that ticket's own uuid at
+ * FRONTEND_URL/verify/{uuid}) and regenerated fresh at send time rather than
+ * stored - QRCode.toDataURL is cheap, and every other resend path in this app
+ * (routes/tickets.js's /:id/send-email, /send-order-email) does the same
+ * rather than caching the image.
  *
  * The daily quota is checked per recipient, same as bulk email - another
  * send may be consuming it concurrently. If it runs out mid-list, the
@@ -141,14 +162,27 @@ async function sendEventReminder(event) {
   const { date: startsDate, time: startsTime } = splitStamp(event.starts_at_text);
   const when = [prettyDate(startsDate), prettyTime(startsTime)].filter(Boolean).join(' at ');
 
-  const recipients = (await db.query(
-    `SELECT MIN(name) AS name, email, COUNT(*)::int AS ticket_count
+  // Individual ticket rows, not grouped/counted - a QR code is per-ticket, so
+  // someone holding two tickets needs two codes. Consolidated into one email
+  // per address just below, the same way an order-time confirmation email
+  // consolidates multiple tickets.
+  const ticketRows = (await db.query(
+    `SELECT id, name, email, uuid
        FROM tickets
       WHERE event_id = $1 AND shop_id = $2 AND status = 'valid' AND email IS NOT NULL
-      GROUP BY email
-      ORDER BY email`,
+      ORDER BY email, id`,
     [event.id, event.shop_id]
   )).rows;
+
+  const byEmail = new Map();
+  for (const row of ticketRows) {
+    const key = row.email.toLowerCase();
+    if (!byEmail.has(key)) byEmail.set(key, { email: row.email, name: row.name, tickets: [] });
+    byEmail.get(key).tickets.push(row);
+  }
+  const recipients = [...byEmail.values()];
+
+  const frontendUrl = process.env.FRONTEND_URL || 'http://localhost';
 
   let sent = 0;
   let failed = 0;
@@ -164,11 +198,25 @@ async function sendEventReminder(event) {
     }
 
     try {
+      // Index order here must match renderReminderEmail's ticket ordering -
+      // that is what makes each `cid:qrcode${i}` reference resolve to the
+      // right attachment.
+      const attachments = await Promise.all(recipient.tickets.map(async (ticket, i) => {
+        const verifyUrl = `${frontendUrl}/verify/${ticket.uuid}`;
+        const dataUrl = await QRCode.toDataURL(verifyUrl);
+        return {
+          filename: `qr-code-${i + 1}.png`,
+          content: dataUrl.replace(/^data:image\/png;base64,/, ''),
+          content_id: `qrcode${i}`,
+        };
+      }));
+
       await sendViaResend({
         from: getSender(),
         to: recipient.email,
         subject: `Reminder: ${event.name} is today`,
         html: renderReminderEmail({ event, orgName, when }, recipient),
+        attachments,
       });
       await db.query(
         'INSERT INTO email_send_log (shop_id, recipient_email, send_type, success) VALUES ($1, $2, $3, true)',
