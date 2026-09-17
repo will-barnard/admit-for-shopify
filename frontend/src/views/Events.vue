@@ -130,6 +130,13 @@
           <div class="event-actions">
             <button @click="openEditModal(event)" class="btn-small" :disabled="event.archived">Edit</button>
             <button
+              @click="openGuestListModal(event)"
+              class="btn-small"
+              title="Email this event's guest list (names, ticket counts, emails) to whoever you specify"
+            >
+              Email guest list
+            </button>
+            <button
               v-if="!event.published_at"
               class="btn-small btn-publish"
               :disabled="event.archived || publishing === event.id"
@@ -342,6 +349,38 @@
         </form>
       </div>
     </div>
+
+    <!-- Email guest list -->
+    <div v-if="showGuestListModal" class="modal-overlay" @click.self="closeGuestListModal">
+      <div class="modal modal-narrow">
+        <h3>Email guest list</h3>
+        <p class="hint">
+          Sends a table of everyone with a valid ticket to "{{ guestListEvent?.name }}" - name, email,
+          and how many tickets they hold - to whoever you list below, as both an inline table and a CSV
+          attachment. This is a report about your guests, sent to your team; it does not go to the guests
+          themselves.
+        </p>
+        <form @submit.prevent="sendGuestListEmail">
+          <div class="form-group">
+            <label>Recipient(s)</label>
+            <textarea
+              v-model="guestListRecipients"
+              rows="3"
+              placeholder="e.g. door-staff@yourshop.com, you@yourshop.com"
+              required
+            ></textarea>
+            <p class="hint">One or more email addresses, separated by commas, spaces, or new lines.</p>
+          </div>
+          <div v-if="guestListError" class="error-message">{{ guestListError }}</div>
+          <div class="modal-actions">
+            <button type="button" @click="closeGuestListModal" class="btn-secondary">Cancel</button>
+            <button type="submit" class="btn-primary" :disabled="guestListSending">
+              {{ guestListSending ? 'Sending…' : 'Send' }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -376,6 +415,11 @@ export default {
     const showHelp = ref(false);
     const publishing = ref(null);
     const sendingReminder = ref(false);
+    const showGuestListModal = ref(false);
+    const guestListEvent = ref(null);
+    const guestListRecipients = ref('');
+    const guestListSending = ref(false);
+    const guestListError = ref('');
 
     const form = reactive({
       name: '',
@@ -774,6 +818,46 @@ export default {
       }
     };
 
+    const openGuestListModal = (event) => {
+      guestListEvent.value = event;
+      guestListRecipients.value = '';
+      guestListError.value = '';
+      showGuestListModal.value = true;
+    };
+
+    const closeGuestListModal = () => {
+      showGuestListModal.value = false;
+      guestListEvent.value = null;
+    };
+
+    // Comma, whitespace or newline - whatever someone naturally types when
+    // pasting a couple of addresses in.
+    const parseRecipients = (raw) => (raw || '')
+      .split(/[,\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const sendGuestListEmail = async () => {
+      const event = guestListEvent.value;
+      if (!event) return;
+      const recipients = parseRecipients(guestListRecipients.value);
+      if (recipients.length === 0) {
+        guestListError.value = 'Enter at least one email address';
+        return;
+      }
+      guestListSending.value = true;
+      guestListError.value = '';
+      try {
+        const { data } = await axios.post(`/api/events/${event.id}/guest-list/email`, { recipients });
+        alert(`Guest list sent to ${recipients.join(', ')}: ${data.guestCount} guest(s), ${data.totalTickets} ticket(s).`);
+        closeGuestListModal();
+      } catch (err) {
+        guestListError.value = err.response?.data?.error || 'Could not send the guest list';
+      } finally {
+        guestListSending.value = false;
+      }
+    };
+
     const deleteEvent = async (event) => {
       if (event.ticket_count > 0) return;
       if (!confirm(`Delete "${event.name}"? This cannot be undone.`)) return;
@@ -828,7 +912,9 @@ export default {
       publishing, publishEvent, unpublishEvent,
       formatDate, formatWhen, onHasEndChanged, showChangePassword, handleLogout,
       reminderLabel, prettyTime, prettyDate, splitStamp,
-      sendingReminder, sendReminderNow
+      sendingReminder, sendReminderNow,
+      showGuestListModal, guestListEvent, guestListRecipients, guestListSending, guestListError,
+      openGuestListModal, closeGuestListModal, sendGuestListEmail
     };
   }
 };
@@ -920,6 +1006,7 @@ export default {
 
 .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 1000; }
 .modal { background: white; padding: 32px; border-radius: 12px; width: 100%; max-width: 620px; max-height: 90vh; overflow-y: auto; }
+.modal.modal-narrow { max-width: 480px; }
 .modal h3 { margin: 0 0 24px 0; font-size: 22px; color: #333; }
 
 .form-group { margin-bottom: 18px; }

@@ -5,6 +5,7 @@ const authMiddleware = require('../middleware/auth');
 const requireRole = require('../middleware/require-role');
 const eventPublish = require('../services/event-publish');
 const reminderJobs = require('../services/reminder-jobs');
+const guestList = require('../services/guest-list');
 
 // Reads stay open to any signed-in user - the scanner needs the active-event
 // list. Every write is admin or superadmin: a 'verifier' door account could
@@ -485,6 +486,25 @@ router.post('/:id/reminder/send-now', authMiddleware, requireRole('superadmin'),
   } catch (error) {
     console.error('Error sending reminder now:', error.message);
     res.status(500).json({ error: error.message || 'Failed to send reminder' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Guest list
+//
+// A report ABOUT the guests (name, email, ticket count), emailed to whoever
+// the merchant specifies - door staff, a co-organizer, themselves. Distinct
+// from the reminder above, which emails the guests. Any admin/superadmin can
+// send it (see services/guest-list.js) since it does not reach a customer.
+// ---------------------------------------------------------------------------
+router.post('/:id/guest-list/email', authMiddleware, canManageEvents, async (req, res) => {
+  try {
+    const result = await guestList.sendGuestList(req.shopId, req.params.id, req.body?.recipients);
+    if (!result) return res.status(404).json({ error: 'Event not found' });
+    res.json(result);
+  } catch (error) {
+    console.error('Error emailing guest list:', error.message);
+    res.status(error.status || 500).json({ error: error.message || 'Failed to email the guest list' });
   }
 });
 
